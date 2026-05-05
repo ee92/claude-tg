@@ -1,0 +1,17 @@
+# secrets
+.env
+
+# runtime state
+state.json
+*.log
+
+# python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# editor
+.vscode/
+.idea/
+*.swp

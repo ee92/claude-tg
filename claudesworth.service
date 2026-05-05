@@ -1,0 +1,18 @@
+[Unit]
+Description=Claudesworth — Telegram bridge for Claude Code
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clawd
+WorkingDirectory=/home/clawd/projects/claudesworth
+EnvironmentFile=/home/clawd/projects/claudesworth/.env
+ExecStart=/home/clawd/projects/claudesworth/venv/bin/python /home/clawd/projects/claudesworth/bridge.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/clawd/projects/claudesworth/claudesworth.log
+StandardError=append:/home/clawd/projects/claudesworth/claudesworth.log
+
+[Install]
+WantedBy=multi-user.target
