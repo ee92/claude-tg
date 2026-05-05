@@ -3,10 +3,13 @@ Claudesworth — Telegram bridge for Claude Code.
 
 A single always-on daemon that:
   - holds a Telegram bot connection (single owner: ALLOWED_CHAT_ID)
-  - tracks one "connected" Claude session at a time (active_session_id)
+  - tracks one "connected" Claude session at a time (active_session_id + cwd)
   - receives end-of-turn POSTs from a Claude Stop hook on a localhost intake port
   - forwards the assistant's final text to Telegram only when it matches the
     currently connected session
+  - accepts free-text Telegram messages and pipes them into the connected
+    session via `claude -p -r <id>` (cwd = the session's recorded cwd). The
+    response arrives back through the existing Stop-hook → intake path.
 
 Telegram commands (single user, locked by chat_id):
   /start        - hello
@@ -14,6 +17,9 @@ Telegram commands (single user, locked by chat_id):
   /sessions     - list 10 latest Claude sessions, with inline Connect buttons
   /disconnect   - clear active session
   /help         - command list
+
+Free text (no slash) → sent to the connected session. Messages queue if a
+previous one is still in flight, so back-to-back sends don't stomp each other.
 
 Switching sessions is just a pointer flip in state.json — no per-session
 poller, no leftover connections, nothing to clean up.
@@ -41,7 +47,10 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
+from telegram.helpers import escape_markdown
 
 # ---------------------------------------------------------------------------
 # Config
@@ -93,6 +102,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 @dataclass
 class State:
     active_session_id: Optional[str] = None
+    active_cwd: Optional[str] = None  # session's recorded working dir; used to spawn `claude -p -r`
 
     @classmethod
     def load(cls) -> "State":
@@ -100,14 +110,25 @@ class State:
             return cls()
         try:
             data = json.loads(STATE_PATH.read_text())
-            return cls(active_session_id=data.get("active_session_id") or None)
+            return cls(
+                active_session_id=data.get("active_session_id") or None,
+                active_cwd=data.get("active_cwd") or None,
+            )
         except Exception as e:
             log.warning(f"could not parse state.json ({e}); starting fresh")
             return cls()
 
     def save(self) -> None:
         tmp = STATE_PATH.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"active_session_id": self.active_session_id}, indent=2))
+        tmp.write_text(
+            json.dumps(
+                {
+                    "active_session_id": self.active_session_id,
+                    "active_cwd": self.active_cwd,
+                },
+                indent=2,
+            )
+        )
         tmp.replace(STATE_PATH)
 
 
@@ -268,14 +289,19 @@ async def _gate(update: Update) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _md(text: str) -> str:
+    """Escape a dynamic string for Telegram MarkdownV1."""
+    return escape_markdown(text or "", version=1)
+
+
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _gate(update):
         return
     await update.message.reply_text(
         "👋 Claudesworth online.\n\n"
-        "Use /sessions to pick a session to follow. Once connected, "
-        "every end-of-turn message from that session lands here.\n\n"
-        "/sessions – list 10 latest\n"
+        "/sessions to pick a session to follow. Once connected:\n"
+        "  • every end-of-turn message from that session lands here\n"
+        "  • anything you type back (no slash) gets piped into the session\n\n"
         "/status – show current connection\n"
         "/disconnect – stop following"
     )
@@ -285,11 +311,13 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _gate(update):
         return
     sid = state.active_session_id
+    cwd = state.active_cwd
     if not sid:
         await update.message.reply_text("Not connected to any session.\nUse /sessions to pick one.")
         return
+    cwd_line = f"\n_in_ `{_md(cwd)}`" if cwd else ""
     await update.message.reply_text(
-        f"Connected to session `{_short_sid(sid)}`\n(full id: `{sid}`)",
+        f"Connected to session `{_md(_short_sid(sid))}`{cwd_line}\n(full id: `{_md(sid)}`)",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -300,9 +328,12 @@ async def cmd_disconnect(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> Non
     with state_lock:
         prev = state.active_session_id
         state.active_session_id = None
+        state.active_cwd = None
         state.save()
     if prev:
-        await update.message.reply_text(f"Disconnected from `{_short_sid(prev)}`.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            f"Disconnected from `{_md(_short_sid(prev))}`.", parse_mode=ParseMode.MARKDOWN
+        )
     else:
         await update.message.reply_text("Already disconnected.")
 
@@ -315,7 +346,9 @@ async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/sessions – list 10 latest sessions, tap to connect\n"
         "/status – current connection\n"
         "/disconnect – stop following\n"
-        "/help – this message"
+        "/help – this message\n\n"
+        "Plain text (no slash) → piped into the connected session.\n"
+        "Back-to-back messages queue rather than overlap."
     )
 
 
@@ -333,17 +366,33 @@ async def cmd_sessions(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for i, s in enumerate(sessions, start=1):
         marker = "🟢 " if s.session_id == active else ""
         preview = _truncate(s.last_user_text or "(no user message yet)", 60)
-        lines.append(f"{marker}{i}. *{s.project}* · {_fmt_age(s.mtime)}\n   _{preview}_")
+        lines.append(
+            f"{marker}{i}. *{_md(s.project)}* · {_md(_fmt_age(s.mtime))}\n   _{_md(preview)}_"
+        )
         # button label: short id + project; payload: connect:<sid>
         label = f"{i}. {s.project} · {_short_sid(s.session_id)}"
         keyboard.append([InlineKeyboardButton(label, callback_data=f"connect:{s.session_id}")])
     keyboard.append([InlineKeyboardButton("✕ Disconnect", callback_data="disconnect")])
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    body = "\n".join(lines)
+    try:
+        await update.message.reply_text(
+            body,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    except Exception as e:
+        # Markdown can still trip on edge cases; fall back to plain.
+        log.warning(f"/sessions markdown render failed ({e}); falling back to plain")
+        plain_lines = ["Recent sessions (tap to connect)\n"]
+        for i, s in enumerate(sessions, start=1):
+            marker = "🟢 " if s.session_id == active else ""
+            preview = _truncate(s.last_user_text or "(no user message yet)", 60)
+            plain_lines.append(f"{marker}{i}. {s.project} · {_fmt_age(s.mtime)}\n   {preview}")
+        await update.message.reply_text(
+            "\n".join(plain_lines),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
 
 
 async def on_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -357,18 +406,35 @@ async def on_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if data == "disconnect":
         with state_lock:
             state.active_session_id = None
+            state.active_cwd = None
             state.save()
         await query.edit_message_text("Disconnected.")
         return
     if data.startswith("connect:"):
         sid = data.split(":", 1)[1]
+        # Look up cwd from session list (callback_data is too tight to carry it).
+        cwd: Optional[str] = None
+        for s in list_recent_sessions(SESSION_LIST_LIMIT):
+            if s.session_id == sid:
+                cwd = s.cwd
+                break
         with state_lock:
             state.active_session_id = sid
+            state.active_cwd = cwd
             state.save()
-        await query.edit_message_text(
-            f"Connected to `{_short_sid(sid)}`.\nEnd-of-turn messages will arrive here.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        cwd_line = f"\n_in_ `{_md(cwd)}`" if cwd else ""
+        try:
+            await query.edit_message_text(
+                f"Connected to `{_md(_short_sid(sid))}`.{cwd_line}\n"
+                "End-of-turn messages will arrive here. Type freely to send messages back.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            await query.edit_message_text(
+                f"Connected to {_short_sid(sid)}.\n"
+                + (f"in {cwd}\n" if cwd else "")
+                + "End-of-turn messages will arrive here. Type freely to send messages back."
+            )
         return
 
 
@@ -480,17 +546,159 @@ def _start_intake_server(application: Application, loop: asyncio.AbstractEventLo
 
 
 # ---------------------------------------------------------------------------
+# Inbound: Telegram free text → connected Claude session
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class InboundJob:
+    text: str
+    chat_id: int
+    user_message_id: int
+    target_session_id: str
+    target_cwd: str
+
+
+# Single FIFO queue (only one connected session at a time anyway).
+inbound_queue: "asyncio.Queue[InboundJob]" = asyncio.Queue()
+
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/usr/bin/claude")
+CLAUDE_TIMEOUT_SEC = int(os.environ.get("CLAUDE_TIMEOUT_SEC", "600"))  # 10 min hard cap
+
+
+async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Free text from the owner → enqueue for the connected session."""
+    if not _is_authorized(update):
+        return
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    text = msg.text.strip()
+    if not text:
+        return
+
+    sid = state.active_session_id
+    cwd = state.active_cwd
+    if not sid or not cwd:
+        await msg.reply_text("Not connected to any session.\nUse /sessions to pick one.")
+        return
+
+    # Reaction-as-ack: 👀 means "received, queued"
+    try:
+        await msg.set_reaction("👀")
+    except Exception:
+        pass
+
+    await inbound_queue.put(
+        InboundJob(
+            text=text,
+            chat_id=msg.chat_id,
+            user_message_id=msg.message_id,
+            target_session_id=sid,
+            target_cwd=cwd,
+        )
+    )
+    qsize = inbound_queue.qsize()
+    if qsize > 0:
+        log.info(f"inbound: queued len={qsize+1} sid={_short_sid(sid)}")
+
+
+async def _run_claude(job: InboundJob) -> tuple[int, str, str]:
+    """Spawn `claude -p -r <sid>` against the session's cwd, message via stdin."""
+    cmd = [CLAUDE_BIN, "-p", "-r", job.target_session_id]
+    log.info(
+        f"inbound: spawn sid={_short_sid(job.target_session_id)} "
+        f"cwd={job.target_cwd} bytes={len(job.text)}"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=job.target_cwd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=job.text.encode("utf-8")),
+            timeout=CLAUDE_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return -1, "", f"timeout after {CLAUDE_TIMEOUT_SEC}s"
+    return (
+        proc.returncode if proc.returncode is not None else -1,
+        stdout.decode("utf-8", errors="replace") if stdout else "",
+        stderr.decode("utf-8", errors="replace") if stderr else "",
+    )
+
+
+async def _inbound_worker(application: Application) -> None:
+    """Drain inbound_queue serially. The Stop hook delivers each response."""
+    log.info("inbound worker started")
+    while True:
+        job = await inbound_queue.get()
+        try:
+            # If the user disconnected or switched between enqueue and dequeue,
+            # silently drop this job.
+            if state.active_session_id != job.target_session_id:
+                log.info(
+                    f"inbound: drop stale job sid={_short_sid(job.target_session_id)} "
+                    f"(active={_short_sid(state.active_session_id) if state.active_session_id else '-'})"
+                )
+                continue
+
+            rc, _stdout, stderr = await _run_claude(job)
+
+            if rc != 0:
+                err_short = (stderr or "").strip()
+                if len(err_short) > 600:
+                    err_short = err_short[:600] + "…"
+                msg = f"⚠️ claude exited {rc}\n```\n{err_short or '(no stderr)'}\n```"
+                try:
+                    await application.bot.send_message(
+                        chat_id=job.chat_id,
+                        text=msg,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_to_message_id=job.user_message_id,
+                    )
+                except Exception:
+                    await application.bot.send_message(
+                        chat_id=job.chat_id,
+                        text=f"claude exited {rc}\n{err_short or '(no stderr)'}",
+                        reply_to_message_id=job.user_message_id,
+                    )
+            # rc == 0: response is delivered by the Stop hook → intake → forward path.
+            # Nothing else to do here.
+        except Exception as e:
+            log.exception(f"inbound worker error: {e}")
+            try:
+                await application.bot.send_message(
+                    chat_id=job.chat_id,
+                    text=f"⚠️ inbound worker error: {e}",
+                    reply_to_message_id=job.user_message_id,
+                )
+            except Exception:
+                pass
+        finally:
+            inbound_queue.task_done()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
 async def _post_init(application: Application) -> None:
-    # Once the bot loop is up, start the intake HTTP server bound to this loop.
+    # Once the bot loop is up, start the intake HTTP server bound to this loop
+    # and the inbound worker task.
     loop = asyncio.get_running_loop()
     application.bot_data["intake_httpd"] = _start_intake_server(application, loop)
+    application.bot_data["inbound_worker"] = asyncio.create_task(_inbound_worker(application))
     log.info(
         f"claudesworth ready — chat_id={ALLOWED_CHAT_ID} "
-        f"active_session={_short_sid(state.active_session_id) if state.active_session_id else '-'}"
+        f"active_session={_short_sid(state.active_session_id) if state.active_session_id else '-'} "
+        f"cwd={state.active_cwd or '-'}"
     )
 
 
@@ -508,6 +716,8 @@ def main() -> None:
     app.add_handler(CommandHandler("disconnect", cmd_disconnect))
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CallbackQueryHandler(on_callback))
+    # Free text → inbound. Excludes commands (handled above) and non-text content.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     log.info("claudesworth starting…")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
