@@ -11,8 +11,9 @@ EnvironmentFile=/home/clawd/projects/claudesworth/.env
 ExecStart=/home/clawd/projects/claudesworth/venv/bin/python /home/clawd/projects/claudesworth/bridge.py
 Restart=always
 RestartSec=5
-StandardOutput=append:/home/clawd/projects/claudesworth/claudesworth.log
-StandardError=append:/home/clawd/projects/claudesworth/claudesworth.log
+# Stdout/stderr go to the journal; bridge.py writes its own claudesworth.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
