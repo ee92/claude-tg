@@ -579,9 +579,27 @@ async def on_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     sid = state.active_session_id
     cwd = state.active_cwd
-    if not sid or not cwd:
+    if not sid:
         await msg.reply_text("Not connected to any session.\nUse /sessions to pick one.")
         return
+    # Backfill cwd if missing (e.g. state migrated from a pre-cwd version, or
+    # was hand-edited). Look it up from the on-disk session list.
+    if not cwd:
+        for s in list_recent_sessions(50):
+            if s.session_id == sid:
+                cwd = s.cwd
+                break
+        if cwd:
+            with state_lock:
+                state.active_cwd = cwd
+                state.save()
+            log.info(f"backfilled active_cwd for sid={_short_sid(sid)}: {cwd}")
+        else:
+            await msg.reply_text(
+                "Couldn't find this session's working directory on disk. "
+                "Try /sessions and reconnect to refresh."
+            )
+            return
 
     # Reaction-as-ack: 👀 means "received, queued"
     try:
