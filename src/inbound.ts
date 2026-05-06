@@ -18,6 +18,7 @@ import os from "node:os";
 import { config } from "./config.js";
 import { bot, getActiveSessionId, sendAgentReply } from "./telegram.js";
 import { shortSid } from "./format.js";
+import { claudeBinaryPath } from "./sdkBinary.js";
 
 export interface InboundJob {
   text: string;
@@ -190,6 +191,10 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
         allowDangerouslySkipPermissions: true,
         abortController: controller,
         includePartialMessages: false,
+        // Pin the binary explicitly. The SDK's auto-picker prefers the musl
+        // variant when both are on disk, even on glibc systems — see the
+        // header comment in ./sdkBinary.ts for details.
+        pathToClaudeCodeExecutable: claudeBinaryPath,
         // Append our Telegram-shape guidance to the default Claude Code system
         // prompt. Only added on bridge-driven turns — sessions driven directly
         // from the desktop client are unaffected.
