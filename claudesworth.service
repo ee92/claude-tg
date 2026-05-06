@@ -8,10 +8,10 @@ Type=simple
 User=clawd
 WorkingDirectory=/home/clawd/projects/claudesworth
 EnvironmentFile=/home/clawd/projects/claudesworth/.env
-ExecStart=/home/clawd/projects/claudesworth/venv/bin/python /home/clawd/projects/claudesworth/bridge.py
+ExecStart=/usr/bin/node /home/clawd/projects/claudesworth/dist/index.js
 Restart=always
 RestartSec=5
-# Stdout/stderr go to the journal; bridge.py writes its own claudesworth.log
+# All logs go to journald
 StandardOutput=journal
 StandardError=journal
 
