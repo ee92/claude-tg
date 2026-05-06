@@ -5,7 +5,11 @@
 state.json
 *.log
 
-# python
+# node
+node_modules/
+dist/
+
+# python (legacy — to be removed once TS rewrite verified)
 venv/
 __pycache__/
 *.pyc
