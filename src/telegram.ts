@@ -238,3 +238,16 @@ bot.on("message:photo", async (ctx) => {
 // Read accessors for other modules.
 export function getActiveSessionId(): string | null { return state.active_session_id; }
 export function getActiveCwd(): string | null { return state.active_cwd; }
+
+// Replace the bot's command menu (the slash-command list shown in Telegram clients).
+// setMyCommands fully replaces whatever was previously registered for this bot, so
+// any legacy commands left over from prior incarnations get cleared.
+export async function registerCommandMenu(): Promise<void> {
+  await bot.api.setMyCommands([
+    { command: "sessions", description: "List recent sessions, tap to connect" },
+    { command: "status",   description: "Show current connection" },
+    { command: "disconnect", description: "Stop following the current session" },
+    { command: "help",     description: "Show available commands" },
+  ]);
+  console.log("telegram: command menu registered");
+}

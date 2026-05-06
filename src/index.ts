@@ -1,6 +1,6 @@
 // Boots the Telegram bot, the HTTP intake, and the inbound worker.
 
-import { bot, getActiveSessionId, getActiveCwd } from "./telegram.js";
+import { bot, getActiveSessionId, getActiveCwd, registerCommandMenu } from "./telegram.js";
 import { startIntake } from "./intake.js";
 import { shortSid } from "./format.js";
 import { config } from "./config.js";
@@ -9,6 +9,14 @@ async function main(): Promise<void> {
   console.log("claudesworth starting…");
 
   const intake = startIntake();
+
+  // Replace any legacy command menu entries left over on this bot token.
+  // Failure here is non-fatal — log and keep starting.
+  try {
+    await registerCommandMenu();
+  } catch (e) {
+    console.warn(`telegram: failed to register command menu: ${(e as Error).message}`);
+  }
 
   const shutdown = (sig: string) => {
     console.log(`received ${sig}, shutting down`);
