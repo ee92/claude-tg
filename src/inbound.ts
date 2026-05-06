@@ -10,9 +10,14 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "./config.js";
 import { bot, getActiveSessionId } from "./telegram.js";
-import { shortSid } from "./format.js";
+import { shortSid, formatTokens } from "./format.js";
 import { claudeBinaryPath } from "./sdkBinary.js";
 import { createTelegramAttachServer } from "./telegramAttachTool.js";
+
+// Sentinel text on an InboundJob that triggers a /compact run rather than a
+// normal turn. Routed through the same queue so it serializes behind any
+// in-flight reply instead of interrupting it.
+const COMPACT_SENTINEL = "/compact";
 
 // One MCP server instance shared across all bridge-driven turns. Lazy-init,
 // not module-top-level: telegram.ts and inbound.ts form an import cycle (the
@@ -93,6 +98,10 @@ async function runJob(job: InboundJob): Promise<void> {
       `inbound: drop stale sid=${shortSid(job.targetSessionId)} (active=${active ? shortSid(active) : "-"})`,
     );
     return;
+  }
+
+  if (job.text === COMPACT_SENTINEL) {
+    return runCompactJob(job);
   }
 
   console.log(
@@ -201,4 +210,132 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
   }
 
   return { code: exitCode, stderr };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// /compact path. Runs through the same queue as normal turns, so it
+// serializes behind any in-flight reply rather than interrupting it.
+// The CLI handles `/compact` as a local slash command (model loop is
+// bypassed; the SDK emits a system/compact_boundary message with token
+// stats once the summary is written back to the transcript).
+
+interface CompactResult {
+  preTokens?: number;
+  postTokens?: number;
+  durationMs?: number;
+  error?: string;
+}
+
+async function runCompactJob(job: InboundJob): Promise<void> {
+  console.log(`inbound: compact sid=${shortSid(job.targetSessionId)}`);
+
+  try {
+    await bot.api.sendMessage(job.chatId, "🔄 Compacting connected session…", {
+      reply_parameters: { message_id: job.userMessageId },
+    });
+  } catch (e) {
+    console.error(`inbound: failed to send compact-start notice: ${(e as Error).message}`);
+  }
+
+  await sendTyping(job.chatId);
+  const typingInterval = setInterval(() => void sendTyping(job.chatId), 4000);
+
+  let result: CompactResult;
+  try {
+    result = await runClaudeCompact(job);
+  } finally {
+    clearInterval(typingInterval);
+  }
+
+  if (result.error) {
+    const errShort = result.error.length > 600 ? result.error.slice(0, 600) + "…" : result.error;
+    try {
+      await bot.api.sendMessage(job.chatId, `⚠️ Compaction failed: ${errShort}`);
+    } catch (e) {
+      console.error(`inbound: failed to report compact error: ${(e as Error).message}`);
+    }
+    return;
+  }
+
+  let body = "✅ Compaction complete";
+  if (result.preTokens != null && result.postTokens != null) {
+    const pieces = [
+      `${formatTokens(result.preTokens)} → ${formatTokens(result.postTokens)} tokens`,
+    ];
+    if (result.durationMs != null) {
+      pieces.push(`${(result.durationMs / 1000).toFixed(1)}s`);
+    }
+    body += ` (${pieces.join(", ")})`;
+  }
+
+  try {
+    await bot.api.sendMessage(job.chatId, body);
+  } catch (e) {
+    console.error(`inbound: failed to send compact-done notice: ${(e as Error).message}`);
+  }
+}
+
+async function runClaudeCompact(job: InboundJob): Promise<CompactResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(),
+    config.claudeTimeoutSec * 1000,
+  );
+
+  const result: CompactResult = {};
+  let sdkStderr = "";
+
+  try {
+    const q = query({
+      prompt: COMPACT_SENTINEL,
+      options: {
+        resume: job.targetSessionId,
+        cwd: job.targetCwd,
+        permissionMode: "bypassPermissions",
+        allowDangerouslySkipPermissions: true,
+        abortController: controller,
+        includePartialMessages: false,
+        pathToClaudeCodeExecutable: claudeBinaryPath,
+        // Skip the Telegram-shape nudge and telegram_send tool — /compact is
+        // a local slash command that bypasses the model loop, so neither
+        // would do anything useful here.
+        stderr: (line: string) => { sdkStderr += line; },
+      },
+    });
+
+    for await (const msg of q) {
+      if (msg.type === "system" && msg.subtype === "compact_boundary") {
+        const meta = msg.compact_metadata;
+        result.preTokens = meta.pre_tokens;
+        result.postTokens = meta.post_tokens;
+        result.durationMs = meta.duration_ms;
+      } else if (msg.type === "result") {
+        const r = msg as { subtype?: string; is_error?: boolean; errors?: string[] };
+        if (r.subtype && r.subtype !== "success") {
+          const detail = r.is_error ? (r.errors ?? []).join("; ") : "";
+          result.error = `result subtype=${r.subtype}${detail ? ` — ${detail}` : ""}`;
+        }
+      }
+    }
+  } catch (e) {
+    result.error = controller.signal.aborted
+      ? `timeout after ${config.claudeTimeoutSec}s`
+      : ((e as Error).message ?? String(e));
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (result.error) {
+    console.error(
+      `inbound: compact failed sid=${shortSid(job.targetSessionId)} error=${result.error}` +
+      (sdkStderr ? ` sdk_stderr=${sdkStderr.replace(/\s+/g, " ").slice(0, 1000)}` : ""),
+    );
+  } else {
+    console.log(
+      `inbound: compact ok sid=${shortSid(job.targetSessionId)} ` +
+      `pre=${result.preTokens} post=${result.postTokens} dur_ms=${result.durationMs}`,
+    );
+  }
+
+  return result;
 }

@@ -47,6 +47,7 @@ const HELP_TEXT =
   "Commands:\n" +
   "/sessions – list recent sessions, tap to connect\n" +
   "/status – current connection\n" +
+  "/compact – compact the connected session\n" +
   "/disconnect – stop following\n" +
   "/help – this message\n\n" +
   "Plain text → piped into the connected session as a user message.\n" +
@@ -93,6 +94,24 @@ bot.command("status", async (ctx) => {
   msg = fmt`${msg}\n(full id: ${code}${sid}${code})`;
 
   await ctx.reply(msg.text, { entities: msg.entities });
+});
+
+// Forward /compact to the connected session. Routed through the inbound
+// queue so it serializes behind any in-flight reply rather than
+// interrupting it. Bridge surfaces "started" / "complete" notices; the
+// CLI's local slash-command handler does the work.
+bot.command("compact", async (ctx) => {
+  if (!ctx.message || !ctx.chat) return;
+  const target = await resolveTarget(ctx);
+  if (!target) return;
+  await ack(ctx);
+  enqueueInbound({
+    text: "/compact",
+    chatId: ctx.chat.id,
+    userMessageId: ctx.message.message_id,
+    targetSessionId: target.sid,
+    targetCwd: target.cwd,
+  });
 });
 
 bot.command("disconnect", async (ctx) => {
@@ -306,10 +325,11 @@ export async function sendAgentReply(
 // any legacy commands left over from prior incarnations get cleared.
 export async function registerCommandMenu(): Promise<void> {
   await bot.api.setMyCommands([
-    { command: "sessions", description: "List recent sessions, tap to connect" },
-    { command: "status",   description: "Show current connection" },
+    { command: "sessions",   description: "List recent sessions, tap to connect" },
+    { command: "status",     description: "Show current connection" },
+    { command: "compact",    description: "Compact the connected session" },
     { command: "disconnect", description: "Stop following the current session" },
-    { command: "help",     description: "Show available commands" },
+    { command: "help",       description: "Show available commands" },
   ]);
   console.log("telegram: command menu registered");
 }
