@@ -14,9 +14,18 @@ import { shortSid } from "./format.js";
 import { claudeBinaryPath } from "./sdkBinary.js";
 import { createTelegramAttachServer } from "./telegramAttachTool.js";
 
-// One MCP server instance shared across all bridge-driven turns. Bot + chat
-// id are constant for the life of the process, so the server can be too.
-const telegramMcpServer = createTelegramAttachServer(bot, config.allowedChatId);
+// One MCP server instance shared across all bridge-driven turns. Lazy-init,
+// not module-top-level: telegram.ts and inbound.ts form an import cycle (the
+// bot handler enqueues, the queue invokes the bot), so reading `bot` at
+// module evaluation time hits ESM's TDZ. By first-message time the cycle is
+// fully resolved and `bot` is initialized.
+let _telegramMcpServer: ReturnType<typeof createTelegramAttachServer> | null = null;
+function getTelegramMcpServer() {
+  if (!_telegramMcpServer) {
+    _telegramMcpServer = createTelegramAttachServer(bot, config.allowedChatId);
+  }
+  return _telegramMcpServer;
+}
 
 export interface InboundJob {
   text: string;
@@ -150,7 +159,7 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
         // Register the in-process telegram_send tool so the agent can ship
         // files (charts, screenshots, generated artifacts) back as real
         // Telegram attachments. See ./telegramAttachTool.ts.
-        mcpServers: { telegram: telegramMcpServer },
+        mcpServers: { telegram: getTelegramMcpServer() },
         // Pipe the bundled CLI's stderr into our log surface — without this
         // the SDK silently discards it and any failure shows up as a bare
         // "claude exited -1" with no diagnostic text.
