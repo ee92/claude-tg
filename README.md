@@ -9,46 +9,44 @@ sessions with one tap; only one session is followed at a time.
 
 ## Architecture
 
+Two directions, one delivery path:
+
 ```
-            ┌─────────────────── Telegram ────────────────────┐
-            │                                                  │
-            ▼                                                  │
-       grammY bot ──┐                                          │
-                    │   enqueue                                │
-                    ▼                                          │
-               inbound queue ──── SDK query() ──► Claude Code ─┤
-                    │                                  │       │
-                    │ forward reply (race-free,        │       │
-                    │  from SDK iterator end)          ▼       │
-                    └────────────────────────► Telegram ───────┘
-                                                       ▲
-                                                       │
-       Stop hook ──HTTP POST──► intake :8765 ──────────┘
-       (catches turns driven outside the bridge,
-        suppressed while the bridge owns a turn)
+                    Telegram ──user input──► grammY bot ──► inbound queue
+                                                                  │
+                                                            SDK query()
+                                                                  ▼
+                                                            Claude Code
+                                                                  │
+                                                          end of turn
+                                                                  │
+       Telegram ◄──── intake :8765 ◄──HTTP POST── Stop hook ◄─────┘
+                          (only when posted session
+                           matches the connected one)
 ```
 
 - **`src/telegram.ts`** — grammY bot. Handles `/sessions`, `/status`,
   `/disconnect`, free-text, and photo messages. All handlers are gated on a
-  single configured chat id.
+  single configured chat id. Owns `sendAgentReply` — the shared Markdown→
+  Telegram-HTML formatter used by intake on every delivery.
 - **`src/inbound.ts`** — FIFO queue + worker. For each Telegram message, calls
   `query({ prompt, options: { resume, cwd, … } })` on the
-  `@anthropic-ai/claude-agent-sdk`, accumulates the assistant text from the
-  iterator, and forwards it to Telegram. The Stop hook still fires for these
-  bridge-driven turns; an in-memory suppression flag tells the intake to drop
-  those duplicate fires.
+  `@anthropic-ai/claude-agent-sdk` to drive the agent. It does **not** deliver
+  the reply — it just drains the iterator to detect failures. Delivery is
+  always handled by the Stop hook → intake path so external turns and
+  bridge-driven turns share a single channel.
 - **`src/intake.ts`** — minimal `node:http` server bound to `127.0.0.1:8765`.
   Receives Stop-hook payloads and forwards them to Telegram only when the
-  posted session matches the currently-connected one and the bridge isn't
-  already handling that session.
+  posted session matches the currently-connected one.
 - **`src/sessions.ts`** — walks `~/.claude/projects/*/<sid>.jsonl` to surface
   recent sessions for `/sessions` and to recover a session's canonical `cwd`
   on demand.
 - **`src/state.ts`** — atomic JSON read/write of `state.json` (active session
   id + cwd).
-- **`hook.sh`** — shell-only Claude Code Stop hook. Reads the hook event JSON
-  on stdin, slurps the latest assistant text from the transcript, POSTs it to
-  the intake. Silent no-op if the daemon is down. Never blocks Claude.
+- **`hook.sh`** — shell-only Claude Code Stop hook. Pulls the assistant text
+  from the `last_assistant_message` field on the event JSON (Anthropic added
+  this specifically to avoid the JSONL-flush race), POSTs it to the intake.
+  Silent no-op if the daemon is down. Never blocks Claude.
 - **`src/index.ts`** — wires it all up, handles `SIGTERM`/`SIGINT`.
 
 ## Telegram commands

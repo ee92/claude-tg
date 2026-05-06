@@ -267,8 +267,8 @@ export function getActiveCwd(): string | null { return state.active_cwd; }
 // Format an agent's Markdown reply as Telegram-HTML and send it to the
 // allowed chat. Handles chunking on safe block boundaries, prepends a small
 // session-identifying header to the first chunk, and falls back to plain
-// text if Telegram rejects the formatted send. Shared between the SDK-driven
-// (inbound.ts) and Stop-hook-driven (intake.ts) forward paths.
+// text if Telegram rejects the formatted send. Called from intake on every
+// Stop-hook delivery.
 export async function sendAgentReply(
   sessionId: string,
   projectLabel: string,
