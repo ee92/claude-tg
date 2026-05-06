@@ -1,12 +1,12 @@
-// Persistent state — atomically written to state.json. Schema matches the
-// Python bridge exactly so we can swap the binary without touching state.
+// Persistent active-session pointer. JSON on disk, written atomically via
+// tmp + rename so a mid-write crash never leaves a half-written file.
 
 import { promises as fs } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// state.json sits at the repo root, one level up from the compiled dist/.
 const __dirname = dirname(fileURLToPath(import.meta.url));
-// dist/ is one level under repo root, so state.json lives in the parent dir.
 const STATE_PATH = join(__dirname, "..", "state.json");
 const TMP_PATH = STATE_PATH + ".tmp";
 
@@ -28,7 +28,7 @@ export async function loadState(): Promise<State> {
   } catch (err: unknown) {
     const e = err as NodeJS.ErrnoException;
     if (e.code === "ENOENT") return { ...empty };
-    console.warn(`could not parse state.json (${e.message}); starting fresh`);
+    console.warn(`state: could not parse state.json (${e.message}); starting fresh`);
     return { ...empty };
   }
 }

@@ -24,7 +24,7 @@ bot.use(async (ctx, next) => {
   if (ctx.chat?.id === config.allowedChatId) {
     await next();
   } else if (ctx.chat) {
-    console.warn(`unauthorized access attempt chat_id=${ctx.chat.id}`);
+    console.warn(`telegram: unauthorized access attempt chat_id=${ctx.chat.id}`);
   }
 });
 
@@ -33,27 +33,28 @@ async function ack(ctx: Context): Promise<void> {
   try { await ctx.react("👀"); } catch { /* old client / unsupported */ }
 }
 
+const HELP_TEXT =
+  "Commands:\n" +
+  "/sessions – list recent sessions, tap to connect\n" +
+  "/status – current connection\n" +
+  "/disconnect – stop following\n" +
+  "/help – this message\n\n" +
+  "Plain text → piped into the connected session as a user message.\n" +
+  "Photos → downloaded and shown to the session via its Read tool.\n" +
+  "Back-to-back messages queue rather than overlap.";
+
 bot.command("start", async (ctx) => {
   await ctx.reply(
     "👋 Claudesworth online.\n\n" +
-    "/sessions to pick a session to follow. Once connected:\n" +
-    "  • every end-of-turn message from that session lands here\n" +
-    "  • anything you type back (no slash) gets piped into the session\n\n" +
-    "/status – show current connection\n" +
-    "/disconnect – stop following"
+    "/sessions to pick a session to follow. Once connected, every end-of-turn " +
+    "message from that session lands here, and anything you send back is piped " +
+    "into the session.\n\n" +
+    HELP_TEXT,
   );
 });
 
 bot.command("help", async (ctx) => {
-  await ctx.reply(
-    "Commands:\n" +
-    "/sessions – list recent sessions, tap to connect\n" +
-    "/status – current connection\n" +
-    "/disconnect – stop following\n" +
-    "/help – this message\n\n" +
-    "Plain text (no slash) → piped into the connected session.\n" +
-    "Back-to-back messages queue rather than overlap."
-  );
+  await ctx.reply(HELP_TEXT);
 });
 
 bot.command("status", async (ctx) => {
@@ -115,7 +116,7 @@ bot.callbackQuery(/^connect:(.+)$/, async (ctx) => {
   state = { active_session_id: sid, active_cwd: cwd };
   await saveState(state);
   const head = fmt`Connected to ${code}${shortSid(sid)}${code}.`;
-  const tail = "\nEnd-of-turn messages will arrive here. Type freely to send messages back.";
+  const tail = "\nEnd-of-turn messages will arrive here. Send text or photos to talk back.";
   const msg = cwd
     ? fmt`${head}\n${i}in ${i}${code}${cwd}${code}${tail}`
     : fmt`${head}${tail}`;
@@ -148,7 +149,7 @@ async function resolveTarget(ctx: Context): Promise<{ sid: string; cwd: string }
     if (cwd) {
       state = { ...state, active_cwd: cwd };
       await saveState(state);
-      console.log(`backfilled active_cwd for sid=${shortSid(sid)}: ${cwd}`);
+      console.log(`telegram: backfilled active_cwd sid=${shortSid(sid)} cwd=${cwd}`);
     } else {
       await ctx.reply(
         "Couldn't find this session's working directory on disk. " +
@@ -213,9 +214,9 @@ bot.on("message:photo", async (ctx) => {
       `${ctx.chat.id}-${ctx.message.message_id}${ext}`,
     );
     await downloadTelegramFile(file.file_path, localPath);
-    console.log(`photo saved sid=${shortSid(target.sid)} path=${localPath}`);
+    console.log(`telegram: photo saved sid=${shortSid(target.sid)} path=${localPath}`);
   } catch (e) {
-    console.error(`photo download failed: ${(e as Error).message}`);
+    console.error(`telegram: photo download failed: ${(e as Error).message}`);
     await ctx.reply("⚠️ couldn't fetch that photo from Telegram.");
     return;
   }

@@ -1,73 +1,146 @@
 # Claudesworth
 
-Tiny Telegram bridge for Claude Code on the VPS.
+A small Telegram bridge for [Claude Code](https://claude.com/claude-code).
 
-You DM `@claudesworth_bot`, pick a Claude session to follow, and from then on
-the final assistant message at the end of every turn lands in your DMs. Pick a
-different session and the previous one is silently dropped. One subscription
-slot, no streaming, no media, no inbound message piping (yet).
+DM the bot, pick a Claude Code session to follow, and from then on you get the
+end-of-turn messages from that session in Telegram. Anything you send back —
+text or photos — gets piped into the session as a user message. Switch
+sessions with one tap; only one session is followed at a time.
 
 ## Architecture
 
 ```
-Claude Code session ──Stop hook──▶ localhost:8765 ──▶ daemon ──▶ Telegram DM
+            ┌─────────────────── Telegram ────────────────────┐
+            │                                                  │
+            ▼                                                  │
+       grammY bot ──┐                                          │
+                    │   enqueue                                │
+                    ▼                                          │
+               inbound queue ──── SDK query() ──► Claude Code ─┤
+                    │                                  │       │
+                    │ forward reply (race-free,        │       │
+                    │  from SDK iterator end)          ▼       │
+                    └────────────────────────► Telegram ───────┘
+                                                       ▲
                                                        │
-                                                  state.json
-                                                  (active_session_id)
+       Stop hook ──HTTP POST──► intake :8765 ──────────┘
+       (catches turns driven outside the bridge,
+        suppressed while the bridge owns a turn)
 ```
 
-- **`bridge.py`** — single-file daemon. Holds the bot connection, the active
-  session pointer, and an HTTP intake on `127.0.0.1:8765`. State persists to
-  `state.json` next to the script.
-- **`hook.sh`** — Claude Code Stop hook. Reads the hook event on stdin, finds
-  the last assistant entry's text blocks, POSTs them to the daemon. Silent
-  no-op if the daemon is down. Never blocks Claude.
-- **`claudesworth.service`** — systemd unit; auto-restarts.
+- **`src/telegram.ts`** — grammY bot. Handles `/sessions`, `/status`,
+  `/disconnect`, free-text, and photo messages. All handlers are gated on a
+  single configured chat id.
+- **`src/inbound.ts`** — FIFO queue + worker. For each Telegram message, calls
+  `query({ prompt, options: { resume, cwd, … } })` on the
+  `@anthropic-ai/claude-agent-sdk`, accumulates the assistant text from the
+  iterator, and forwards it to Telegram. The Stop hook still fires for these
+  bridge-driven turns; an in-memory suppression flag tells the intake to drop
+  those duplicate fires.
+- **`src/intake.ts`** — minimal `node:http` server bound to `127.0.0.1:8765`.
+  Receives Stop-hook payloads and forwards them to Telegram only when the
+  posted session matches the currently-connected one and the bridge isn't
+  already handling that session.
+- **`src/sessions.ts`** — walks `~/.claude/projects/*/<sid>.jsonl` to surface
+  recent sessions for `/sessions` and to recover a session's canonical `cwd`
+  on demand.
+- **`src/state.ts`** — atomic JSON read/write of `state.json` (active session
+  id + cwd).
+- **`hook.sh`** — shell-only Claude Code Stop hook. Reads the hook event JSON
+  on stdin, slurps the latest assistant text from the transcript, POSTs it to
+  the intake. Silent no-op if the daemon is down. Never blocks Claude.
+- **`src/index.ts`** — wires it all up, handles `SIGTERM`/`SIGINT`.
 
 ## Telegram commands
 
-- `/sessions` — list 10 latest sessions, tap a button to connect
+- `/sessions` — list ten most-recent sessions, tap a button to connect
 - `/status` — show current connection
 - `/disconnect` — stop following
-- `/help` — command list
+- `/help` — command summary
 
-Switching sessions is a pointer flip in `state.json`. There's nothing per-session
-to "clean up" — old hook posts that don't match the active id are dropped at
-intake.
+Plain text → goes to the connected session as a user message.
+Photos → downloaded, saved to `/tmp/claudesworth-uploads/`, and shown to the
+session as a path the assistant reads with its Read tool. (Native multimodal
+input is on the SDK roadmap; today the bundled CLI's stream-json parser
+mishandles long single-line JSON inputs, so the file-path path is more
+reliable.)
 
 ## Setup
 
+Requires Node ≥ 22 and `jq` + `curl` in `$PATH` for the Stop hook.
+
 ```sh
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
+# 1. install + build
+npm install
+npm run build
 
-# Fill in token + chat_id
+# 2. configure
 cp .env.example .env
+$EDITOR .env       # set TELEGRAM_BOT_TOKEN and ALLOWED_CHAT_ID
 
-# Smoke-test:
-venv/bin/python bridge.py
+# 3. register the Stop hook in Claude Code's settings
+#    (~/.claude/settings.json), pointing at hook.sh:
+#
+#    {
+#      "hooks": {
+#        "Stop": [
+#          { "hooks": [{ "type": "command",
+#                        "command": "/abs/path/to/hook.sh",
+#                        "timeout": 5 }] }
+#        ]
+#      }
+#    }
 
-# Install as a service (after promote → live folder):
+# 4. run it
+npm start
+```
+
+`/health` on `127.0.0.1:8765` returns `{ "ok": true }` once the intake is
+listening.
+
+## Running as a service
+
+`claudesworth.service` is a stock systemd unit that runs `node dist/index.js`
+under your user, restart-on-failure, with logs going to journald.
+
+```sh
 sudo cp claudesworth.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now claudesworth
+journalctl -u claudesworth -f
 ```
 
-The Claude Code Stop hook gets registered in `~/.claude/settings.json` to point
-at `hook.sh`. The hook uses `jq` and `curl` (both already on the VPS).
+Edit the unit's `User=`, `WorkingDirectory=`, and `EnvironmentFile=` if your
+checkout lives elsewhere.
+
+## Configuration
+
+All via environment variables (loaded from `.env` by the systemd unit, or by
+your shell when running `npm start`):
+
+| Var                     | Required | Default | Notes                                                        |
+|-------------------------|----------|---------|--------------------------------------------------------------|
+| `TELEGRAM_BOT_TOKEN`    | yes      | —       | From [@BotFather](https://t.me/BotFather).                   |
+| `ALLOWED_CHAT_ID`       | yes      | —       | Numeric Telegram chat id; the only chat the bot will answer. |
+| `INTAKE_PORT`           | no       | `8765`  | Local port the Stop hook posts to.                           |
+| `CLAUDE_TIMEOUT_SEC`    | no       | `600`   | Per-turn timeout for SDK invocations.                        |
 
 ## Auth
 
-- Telegram side: locked to a single numeric `ALLOWED_CHAT_ID`. Anyone else's
-  messages are silently ignored.
-- Intake side: bound to `127.0.0.1` only.
+- **Telegram side:** locked to a single numeric `ALLOWED_CHAT_ID`. Anyone
+  else's messages are silently dropped at a grammY middleware.
+- **Intake side:** bound to `127.0.0.1` only — never exposed off-host.
 
-## Extending later
+There is no per-session ACL: anything the configured user can do in their
+own Claude Code, the bot can do on their behalf. The bridge is a personal
+tool, not a multi-tenant service.
 
-The base is intentionally minimal. Likely future bolt-ons:
+## Limitations
 
-- Inbound: pipe Telegram messages back into the connected session
-- Per-project subscriptions (follow all sessions in project X)
-- Streaming partial output instead of end-of-turn only
-- Voice / image / document support
-- Multi-user with per-user active session
+- One subscription slot. Switching sessions is a pointer flip; the previous
+  session is silently dropped (its Stop-hook posts simply no longer match).
+- End-of-turn delivery only — no streaming partials.
+- Photo input goes through a Read-tool detour rather than native multimodal
+  blocks; works, but every photo turn pays one extra tool call.
+- The bundled Claude Code CLI is pinned by the agent SDK version; upgrading
+  the SDK upgrades the Claude Code runtime in lockstep.

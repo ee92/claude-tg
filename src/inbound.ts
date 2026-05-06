@@ -12,7 +12,7 @@
 // `isBridgeHandling()` lets the intake suppress double-forwards while we own
 // the turn.
 
-import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import { fmt, b, code } from "@grammyjs/parse-mode";
 import path from "node:path";
 import os from "node:os";
@@ -20,40 +20,23 @@ import { config } from "./config.js";
 import { bot, getActiveSessionId } from "./telegram.js";
 import { shortSid } from "./format.js";
 
-export type ImageMediaType =
-  | "image/jpeg"
-  | "image/png"
-  | "image/gif"
-  | "image/webp";
-
 export interface InboundJob {
-  // Exactly one of these must be set.
-  text?: string;
-  photo?: {
-    mediaType: ImageMediaType;
-    bytes: Buffer;
-    caption?: string;
-  };
-
+  text: string;
   chatId: number;
   userMessageId: number;
   targetSessionId: string;
   targetCwd: string;
 }
 
-// Structural shape of the user-message content blocks we hand to the SDK. The
-// SDK accepts these because they're structurally identical to Anthropic's
-// ContentBlockParam union; we keep our own narrow type so we don't have to
-// pull in @anthropic-ai/sdk transitively.
-type ContentBlock =
-  | { type: "text"; text: string }
-  | {
-      type: "image";
-      source: { type: "base64"; media_type: ImageMediaType; data: string };
-    };
+interface ClaudeResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
 
-const queue: InboundJob[] = [];
-let running = false;
+// Telegram caps message text at 4096 chars; leave headroom for the header
+// line + truncation marker so an oversize reply still lands cleanly.
+const BODY_CAP = 3500;
 
 // Sessions for which the bridge is currently producing a reply (or just did).
 // Stored as deadline timestamps: while Date.now() < deadline, intake should
@@ -63,8 +46,15 @@ const suppressUntil = new Map<string, number>();
 const RUN_GUARD_MS = 60 * 60 * 1000; // upper bound while a job is running
 const TAIL_GUARD_MS = 8000;          // window to absorb the trailing Stop hook
 
-function suppressFor(sid: string, ms: number): void {
-  suppressUntil.set(sid, Date.now() + ms);
+const queue: InboundJob[] = [];
+let running = false;
+
+export function enqueueInbound(job: InboundJob): void {
+  queue.push(job);
+  console.log(
+    `inbound: queued depth=${queue.length} sid=${shortSid(job.targetSessionId)}`,
+  );
+  void drain();
 }
 
 export function isBridgeHandling(sid: string): boolean {
@@ -77,12 +67,8 @@ export function isBridgeHandling(sid: string): boolean {
   return true;
 }
 
-export function enqueueInbound(job: InboundJob): void {
-  queue.push(job);
-  console.log(
-    `inbound: queued depth=${queue.length} sid=${shortSid(job.targetSessionId)}`
-  );
-  void drain();
+function suppressFor(sid: string, ms: number): void {
+  suppressUntil.set(sid, Date.now() + ms);
 }
 
 async function drain(): Promise<void> {
@@ -108,42 +94,10 @@ function projectLabel(cwd: string): string {
   return cwd === os.homedir() ? "~" : path.basename(cwd);
 }
 
-function describePayload(job: InboundJob): string {
-  if (job.text != null) return `text bytes=${job.text.length}`;
-  if (job.photo) {
-    const cap = job.photo.caption ? ` caption=${job.photo.caption.length}` : "";
-    return `photo ${job.photo.mediaType} bytes=${job.photo.bytes.length}${cap}`;
-  }
-  return "(empty payload)";
-}
-
-function buildContent(job: InboundJob): ContentBlock[] {
-  if (job.text != null) {
-    return [{ type: "text", text: job.text }];
-  }
-  if (job.photo) {
-    const blocks: ContentBlock[] = [
-      {
-        type: "image",
-        source: {
-          type: "base64",
-          media_type: job.photo.mediaType,
-          data: job.photo.bytes.toString("base64"),
-        },
-      },
-    ];
-    if (job.photo.caption) {
-      blocks.push({ type: "text", text: job.photo.caption });
-    }
-    return blocks;
-  }
-  throw new Error("InboundJob has neither text nor photo payload");
-}
-
-const BODY_CAP = 3500;
-
 async function forwardReply(sessionId: string, projLabel: string, text: string): Promise<void> {
-  const body = text.length <= BODY_CAP ? text : text.slice(0, BODY_CAP).trimEnd() + "\n…(truncated)";
+  const body = text.length <= BODY_CAP
+    ? text
+    : text.slice(0, BODY_CAP).trimEnd() + "\n…(truncated)";
   const msg = fmt`${b}${projLabel}${b} · ${code}${shortSid(sessionId)}${code}\n\n${body}`;
   await bot.api.sendMessage(config.allowedChatId, msg.text, {
     entities: msg.entities,
@@ -156,21 +110,22 @@ async function runJob(job: InboundJob): Promise<void> {
   const active = getActiveSessionId();
   if (active !== job.targetSessionId) {
     console.log(
-      `inbound: drop stale sid=${shortSid(job.targetSessionId)} (active=${active ? shortSid(active) : "-"})`
+      `inbound: drop stale sid=${shortSid(job.targetSessionId)} (active=${active ? shortSid(active) : "-"})`,
     );
     return;
   }
 
   console.log(
-    `inbound: query sid=${shortSid(job.targetSessionId)} cwd=${job.targetCwd} ${describePayload(job)}`
+    `inbound: query sid=${shortSid(job.targetSessionId)} cwd=${job.targetCwd} bytes=${job.text.length}`,
   );
 
   // Suppress Stop-hook forwards for this sid for the entire run, then a tail
-  // window past completion. The deadline-based suppression survives back-to-
-  // back jobs: each phase pushes the deadline forward.
+  // window past completion. Each phase pushes the deadline forward so back-
+  // to-back jobs never fall through a stale-timer gap.
   suppressFor(job.targetSessionId, RUN_GUARD_MS);
 
-  // Show "typing..." indicator, refresh every 4s until claude finishes.
+  // Show "typing…" indicator, refresh every 4s until claude finishes
+  // (Telegram's typing action expires after 5s).
   await sendTyping(job.chatId);
   const typingInterval = setInterval(() => void sendTyping(job.chatId), 4000);
 
@@ -187,11 +142,11 @@ async function runJob(job: InboundJob): Promise<void> {
       try {
         await forwardReply(job.targetSessionId, projectLabel(job.targetCwd), reply);
         console.log(
-          `inbound: forwarded sid=${shortSid(job.targetSessionId)} bytes=${reply.length}`
+          `inbound: forwarded sid=${shortSid(job.targetSessionId)} bytes=${reply.length}`,
         );
       } catch (e) {
         console.error(
-          `inbound: forward failed sid=${shortSid(job.targetSessionId)}: ${(e as Error).message}`
+          `inbound: forward failed sid=${shortSid(job.targetSessionId)}: ${(e as Error).message}`,
         );
       }
     } else {
@@ -215,18 +170,6 @@ async function runJob(job: InboundJob): Promise<void> {
   suppressFor(job.targetSessionId, TAIL_GUARD_MS);
 }
 
-interface ClaudeResult { code: number; stdout: string; stderr: string; }
-
-async function* singleUserMessage(
-  content: ContentBlock[],
-): AsyncIterable<SDKUserMessage> {
-  yield {
-    type: "user",
-    message: { role: "user", content },
-    parent_tool_use_id: null,
-  } as SDKUserMessage;
-}
-
 async function runClaude(job: InboundJob): Promise<ClaudeResult> {
   const controller = new AbortController();
   const timer = setTimeout(
@@ -240,12 +183,8 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
   let sdkStderr = "";
 
   try {
-    const content = buildContent(job);
-    // The SDK's prompt accepts an AsyncIterable<SDKUserMessage> for multimodal
-    // input. Structurally compatible: `parent_tool_use_id: null` plus a single
-    // user message with text + image content blocks.
     const q = query({
-      prompt: singleUserMessage(content),
+      prompt: job.text,
       options: {
         resume: job.targetSessionId,
         cwd: job.targetCwd,
@@ -253,9 +192,9 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
         allowDangerouslySkipPermissions: true,
         abortController: controller,
         includePartialMessages: false,
-        // Pipe the bundled CLI's stderr into our own log surface, otherwise the
-        // SDK silently discards it and any failure shows up to the user as a
-        // bare "Claude exited -1" with no diagnostic text.
+        // Pipe the bundled CLI's stderr into our log surface — without this
+        // the SDK silently discards it and any failure shows up as a bare
+        // "claude exited -1" with no diagnostic text.
         stderr: (line: string) => { sdkStderr += line; },
       },
     });
@@ -270,33 +209,30 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
           }
         }
       } else if (msg.type === "result") {
-        const r = msg as { subtype?: string; is_error?: boolean; result?: string; errors?: string[] };
+        const r = msg as { subtype?: string; is_error?: boolean; errors?: string[] };
         if (r.subtype && r.subtype !== "success") {
           exitCode = -1;
-          const detail = r.is_error
-            ? (r.subtype === "success" ? r.result : (r.errors ?? []).join("; "))
-            : "";
+          const detail = r.is_error ? (r.errors ?? []).join("; ") : "";
           stderr = `result subtype=${r.subtype}${detail ? ` — ${detail}` : ""}`;
         }
       }
     }
   } catch (e) {
     exitCode = -1;
-    if (controller.signal.aborted) {
-      stderr = `timeout after ${config.claudeTimeoutSec}s`;
-    } else {
-      stderr = (e as Error).stack ?? String(e);
-    }
+    stderr = controller.signal.aborted
+      ? `timeout after ${config.claudeTimeoutSec}s`
+      : ((e as Error).stack ?? String(e));
   } finally {
     clearTimeout(timer);
   }
 
   if (exitCode !== 0) {
     console.error(
-      `inbound: query failed sid=${shortSid(job.targetSessionId)} code=${exitCode} stderr=${stderr}${sdkStderr ? ` sdk_stderr=${sdkStderr.replace(/\s+/g, " ").slice(0, 1000)}` : ""}`,
+      `inbound: query failed sid=${shortSid(job.targetSessionId)} code=${exitCode} stderr=${stderr}` +
+      (sdkStderr ? ` sdk_stderr=${sdkStderr.replace(/\s+/g, " ").slice(0, 1000)}` : ""),
     );
   } else if (sdkStderr) {
-    // Even on success, surface anything the CLI wrote to stderr (warnings).
+    // Surface anything the CLI wrote to stderr even on success (warnings).
     console.warn(
       `inbound: query ok sid=${shortSid(job.targetSessionId)} sdk_stderr=${sdkStderr.replace(/\s+/g, " ").slice(0, 500)}`,
     );

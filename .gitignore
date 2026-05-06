@@ -9,12 +9,6 @@ state.json
 node_modules/
 dist/
 
-# python (legacy — to be removed once TS rewrite verified)
-venv/
-__pycache__/
-*.pyc
-.pytest_cache/
-
 # editor
 .vscode/
 .idea/
