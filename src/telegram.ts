@@ -5,13 +5,15 @@
 import { Bot, Context, InlineKeyboard } from "grammy";
 import { fmt, b, i, code, FormattedString } from "@grammyjs/parse-mode";
 import path from "node:path";
+import fs from "node:fs/promises";
 import { config } from "./config.js";
 import { listRecentSessions, findSessionCwd } from "./sessions.js";
 import { age, shortSid, truncate } from "./format.js";
 import { loadState, saveState } from "./state.js";
-import { enqueueInbound, type ImageMediaType } from "./inbound.js";
+import { enqueueInbound } from "./inbound.js";
 
 const SESSION_LIST_LIMIT = 10;
+const UPLOAD_DIR = "/tmp/claudesworth-uploads";
 
 let state = await loadState();
 
@@ -177,42 +179,41 @@ bot.on("message:text", async (ctx) => {
   });
 });
 
-// Download a Telegram file by its API-relative path into memory as a Buffer.
-async function downloadTelegramFile(filePath: string): Promise<Buffer> {
+// Download a Telegram file by its API-relative path to a local file.
+async function downloadTelegramFile(filePath: string, savePath: string): Promise<void> {
   const url = `https://api.telegram.org/file/bot${config.telegramBotToken}/${filePath}`;
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  return Buffer.from(await resp.arrayBuffer());
+  const buf = Buffer.from(await resp.arrayBuffer());
+  await fs.writeFile(savePath, buf);
 }
 
-function mediaTypeFromExt(filePath: string): ImageMediaType {
-  switch (path.extname(filePath).toLowerCase()) {
-    case ".png":  return "image/png";
-    case ".gif":  return "image/gif";
-    case ".webp": return "image/webp";
-    default:      return "image/jpeg";
-  }
-}
-
-// Photos → fetch bytes, enqueue with native multimodal payload. Claude
-// receives the image as a content block on the user message — no Read tool,
-// no file path injection.
+// Photos → save to disk, build a prompt that points Claude at the file path,
+// enqueue same as text. Claude uses its Read tool to view the image.
+//
+// Why not pass the image natively as a multimodal user-message content block?
+// The bundled Claude Code CLI's stream-json input parser intermittently
+// rejects long single-line JSON inputs (~150–200 KB base64 fails, smaller
+// AND larger work). Until that's fixed upstream, the file-path approach is
+// reliable at any size.
 bot.on("message:photo", async (ctx) => {
   const target = await resolveTarget(ctx);
   if (!target) return;
 
   await ack(ctx);
 
-  let bytes: Buffer;
-  let mediaType: ImageMediaType;
+  let localPath: string;
   try {
+    await fs.mkdir(UPLOAD_DIR, { recursive: true });
     const file = await ctx.getFile(); // grammY picks the largest PhotoSize
     if (!file.file_path) throw new Error("no file_path in Telegram response");
-    mediaType = mediaTypeFromExt(file.file_path);
-    bytes = await downloadTelegramFile(file.file_path);
-    console.log(
-      `photo fetched sid=${shortSid(target.sid)} ${mediaType} bytes=${bytes.length}`,
+    const ext = path.extname(file.file_path) || ".jpg";
+    localPath = path.join(
+      UPLOAD_DIR,
+      `${ctx.chat.id}-${ctx.message.message_id}${ext}`,
     );
+    await downloadTelegramFile(file.file_path, localPath);
+    console.log(`photo saved sid=${shortSid(target.sid)} path=${localPath}`);
   } catch (e) {
     console.error(`photo download failed: ${(e as Error).message}`);
     await ctx.reply("⚠️ couldn't fetch that photo from Telegram.");
@@ -220,9 +221,12 @@ bot.on("message:photo", async (ctx) => {
   }
 
   const caption = (ctx.message.caption ?? "").trim();
+  const promptText = caption
+    ? `The user attached an image at ${localPath}. Read it with the Read tool, then respond.\n\nCaption: ${caption}`
+    : `The user attached an image at ${localPath}. Read it with the Read tool, then respond.`;
 
   enqueueInbound({
-    photo: { mediaType, bytes, caption: caption || undefined },
+    text: promptText,
     chatId: ctx.chat.id,
     userMessageId: ctx.message.message_id,
     targetSessionId: target.sid,
