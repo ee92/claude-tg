@@ -12,6 +12,11 @@ import { config } from "./config.js";
 import { bot, getActiveSessionId } from "./telegram.js";
 import { shortSid } from "./format.js";
 import { claudeBinaryPath } from "./sdkBinary.js";
+import { createTelegramAttachServer } from "./telegramAttachTool.js";
+
+// One MCP server instance shared across all bridge-driven turns. Bot + chat
+// id are constant for the life of the process, so the server can be too.
+const telegramMcpServer = createTelegramAttachServer(bot, config.allowedChatId);
 
 export interface InboundJob {
   text: string;
@@ -37,6 +42,8 @@ const TELEGRAM_NUDGE = [
   "- Avoid wide Markdown tables; convert them to short bullet lists or compact prose.",
   "- Skip long horizontal rules and ASCII art; they waste vertical space on a phone.",
   "- Use bold / italics / inline code sparingly, only for genuine emphasis.",
+  "",
+  "Sharing files: when a file (image, chart, screenshot, PDF, etc.) would be more useful to the user than a description, call the `telegram_send` tool with its absolute path. The file appears in Telegram immediately, in addition to your text reply.",
 ].join("\n");
 
 const queue: InboundJob[] = [];
@@ -140,6 +147,10 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
         // prompt. Only added on bridge-driven turns — sessions driven directly
         // from the desktop client are unaffected.
         systemPrompt: { type: "preset", preset: "claude_code", append: TELEGRAM_NUDGE },
+        // Register the in-process telegram_send tool so the agent can ship
+        // files (charts, screenshots, generated artifacts) back as real
+        // Telegram attachments. See ./telegramAttachTool.ts.
+        mcpServers: { telegram: telegramMcpServer },
         // Pipe the bundled CLI's stderr into our log surface — without this
         // the SDK silently discards it and any failure shows up as a bare
         // "claude exited -1" with no diagnostic text.
