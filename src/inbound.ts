@@ -237,6 +237,7 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
   let assistantText = "";
   let exitCode = 0;
   let stderr = "";
+  let sdkStderr = "";
 
   try {
     const content = buildContent(job);
@@ -252,6 +253,10 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
         allowDangerouslySkipPermissions: true,
         abortController: controller,
         includePartialMessages: false,
+        // Pipe the bundled CLI's stderr into our own log surface, otherwise the
+        // SDK silently discards it and any failure shows up to the user as a
+        // bare "Claude exited -1" with no diagnostic text.
+        stderr: (line: string) => { sdkStderr += line; },
       },
     });
 
@@ -265,10 +270,13 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
           }
         }
       } else if (msg.type === "result") {
-        const subtype = (msg as { subtype?: string }).subtype;
-        if (subtype && subtype !== "success") {
+        const r = msg as { subtype?: string; is_error?: boolean; result?: string; errors?: string[] };
+        if (r.subtype && r.subtype !== "success") {
           exitCode = -1;
-          stderr = `result subtype=${subtype}`;
+          const detail = r.is_error
+            ? (r.subtype === "success" ? r.result : (r.errors ?? []).join("; "))
+            : "";
+          stderr = `result subtype=${r.subtype}${detail ? ` — ${detail}` : ""}`;
         }
       }
     }
@@ -281,6 +289,17 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
     }
   } finally {
     clearTimeout(timer);
+  }
+
+  if (exitCode !== 0) {
+    console.error(
+      `inbound: query failed sid=${shortSid(job.targetSessionId)} code=${exitCode} stderr=${stderr}${sdkStderr ? ` sdk_stderr=${sdkStderr.replace(/\s+/g, " ").slice(0, 1000)}` : ""}`,
+    );
+  } else if (sdkStderr) {
+    // Even on success, surface anything the CLI wrote to stderr (warnings).
+    console.warn(
+      `inbound: query ok sid=${shortSid(job.targetSessionId)} sdk_stderr=${sdkStderr.replace(/\s+/g, " ").slice(0, 500)}`,
+    );
   }
 
   return { code: exitCode, stdout: assistantText, stderr };
