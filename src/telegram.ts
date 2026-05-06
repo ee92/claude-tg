@@ -4,6 +4,8 @@
 
 import { Bot, Context, InlineKeyboard } from "grammy";
 import { fmt, b, i, code, FormattedString } from "@grammyjs/parse-mode";
+import path from "node:path";
+import fs from "node:fs/promises";
 import { config } from "./config.js";
 import { listRecentSessions, findSessionCwd } from "./sessions.js";
 import { age, shortSid, truncate } from "./format.js";
@@ -11,6 +13,7 @@ import { loadState, saveState } from "./state.js";
 import { enqueueInbound } from "./inbound.js";
 
 const SESSION_LIST_LIMIT = 10;
+const UPLOAD_DIR = "/tmp/claudesworth-uploads";
 
 let state = await loadState();
 
@@ -131,17 +134,14 @@ bot.callbackQuery("disconnect", async (ctx) => {
   try { await ctx.editMessageText("Disconnected."); } catch { /* ignore */ }
 });
 
-// Free text → enqueue for the connected session.
-bot.on("message:text", async (ctx) => {
-  const text = ctx.message.text.trim();
-  if (!text) return;
-  if (text.startsWith("/")) return; // commands handled above
-
+// Resolve the connected session + cwd, replying with a helpful error and
+// returning null if not connected. Shared by text and photo handlers.
+async function resolveTarget(ctx: Context): Promise<{ sid: string; cwd: string } | null> {
   let sid = state.active_session_id;
   let cwd = state.active_cwd;
   if (!sid) {
     await ctx.reply("Not connected to any session.\nUse /sessions to pick one.");
-    return;
+    return null;
   }
   if (!cwd) {
     cwd = await findSessionCwd(sid);
@@ -154,17 +154,77 @@ bot.on("message:text", async (ctx) => {
         "Couldn't find this session's working directory on disk. " +
         "Try /sessions and reconnect to refresh."
       );
-      return;
+      return null;
     }
   }
+  return { sid, cwd };
+}
+
+// Free text → enqueue for the connected session.
+bot.on("message:text", async (ctx) => {
+  const text = ctx.message.text.trim();
+  if (!text) return;
+  if (text.startsWith("/")) return; // commands handled above
+
+  const target = await resolveTarget(ctx);
+  if (!target) return;
 
   await ack(ctx);
   enqueueInbound({
     text,
     chatId: ctx.chat.id,
     userMessageId: ctx.message.message_id,
-    targetSessionId: sid,
-    targetCwd: cwd,
+    targetSessionId: target.sid,
+    targetCwd: target.cwd,
+  });
+});
+
+// Download a Telegram file by its API-relative path to a local file.
+async function downloadTelegramFile(filePath: string, savePath: string): Promise<void> {
+  const url = `https://api.telegram.org/file/bot${config.telegramBotToken}/${filePath}`;
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const buf = Buffer.from(await resp.arrayBuffer());
+  await fs.writeFile(savePath, buf);
+}
+
+// Photos → save to disk, build a prompt that points Claude at the file path,
+// enqueue same as text. Claude uses its Read tool to actually view the image.
+bot.on("message:photo", async (ctx) => {
+  const target = await resolveTarget(ctx);
+  if (!target) return;
+
+  await ack(ctx);
+
+  let localPath: string;
+  try {
+    await fs.mkdir(UPLOAD_DIR, { recursive: true });
+    const file = await ctx.getFile(); // grammY picks the largest PhotoSize
+    if (!file.file_path) throw new Error("no file_path in Telegram response");
+    const ext = path.extname(file.file_path) || ".jpg";
+    localPath = path.join(
+      UPLOAD_DIR,
+      `${ctx.chat.id}-${ctx.message.message_id}${ext}`,
+    );
+    await downloadTelegramFile(file.file_path, localPath);
+    console.log(`photo saved sid=${shortSid(target.sid)} path=${localPath}`);
+  } catch (e) {
+    console.error(`photo download failed: ${(e as Error).message}`);
+    await ctx.reply("⚠️ couldn't fetch that photo from Telegram.");
+    return;
+  }
+
+  const caption = (ctx.message.caption ?? "").trim();
+  const promptText = caption
+    ? `The user attached an image at ${localPath}. Read it with the Read tool, then respond.\n\nCaption: ${caption}`
+    : `The user attached an image at ${localPath}. Read it with the Read tool, then respond.`;
+
+  enqueueInbound({
+    text: promptText,
+    chatId: ctx.chat.id,
+    userMessageId: ctx.message.message_id,
+    targetSessionId: target.sid,
+    targetCwd: target.cwd,
   });
 });
 
