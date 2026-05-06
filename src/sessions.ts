@@ -127,6 +127,57 @@ export async function findSessionCwd(sid: string): Promise<string | null> {
   return recent.find((s) => s.sessionId === sid)?.cwd ?? null;
 }
 
+// Look up sessions whose id starts with `prefix`. Walks every project dir on
+// disk (not just the recent N), so /switch can resume an arbitrarily old
+// session — the use case for this command is precisely that the target is
+// not in the /sessions list. Returns matches sorted newest-first.
+export async function findSessionsByPrefix(prefix: string): Promise<SessionSummary[]> {
+  if (!prefix) return [];
+  let projDirs: string[];
+  try {
+    projDirs = await fs.readdir(PROJECTS_DIR);
+  } catch {
+    return [];
+  }
+
+  const candidates: { mtime: number; path: string; sid: string }[] = [];
+  await Promise.all(projDirs.map(async (proj) => {
+    const projPath = join(PROJECTS_DIR, proj);
+    let entries: string[];
+    try {
+      const stat = await fs.stat(projPath);
+      if (!stat.isDirectory()) return;
+      entries = await fs.readdir(projPath);
+    } catch { return; }
+    for (const name of entries) {
+      if (!name.endsWith(".jsonl")) continue;
+      const sid = name.slice(0, -".jsonl".length);
+      if (!sid.startsWith(prefix)) continue;
+      const p = join(projPath, name);
+      try {
+        const st = await fs.stat(p);
+        candidates.push({ mtime: st.mtimeMs, path: p, sid });
+      } catch { /* skip */ }
+    }
+  }));
+
+  candidates.sort((a, b) => b.mtime - a.mtime);
+
+  const out: SessionSummary[] = [];
+  for (const c of candidates) {
+    const { cwd, lastUserText } = await readTranscript(c.path);
+    if (!cwd) continue;
+    out.push({
+      sessionId: c.sid,
+      cwd,
+      project: basename(cwd) || cwd,
+      mtime: c.mtime,
+      lastUserText,
+    });
+  }
+  return out;
+}
+
 // /status enrichment — model, last-turn context size, and count of user-typed
 // messages. Walks all project dirs to locate <sid>.jsonl, then linear-scans.
 export interface SessionStats {

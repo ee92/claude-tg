@@ -11,7 +11,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { homedir } from "node:os";
 import { config } from "./config.js";
-import { listRecentSessions, findSessionCwd, getSessionStats } from "./sessions.js";
+import { listRecentSessions, findSessionCwd, findSessionsByPrefix, getSessionStats } from "./sessions.js";
 import { age, shortSid, truncate, formatTokens } from "./format.js";
 import { loadState, saveState } from "./state.js";
 import { enqueueInbound, cancelActive } from "./inbound.js";
@@ -48,6 +48,7 @@ async function ack(ctx: Context): Promise<void> {
 const HELP_TEXT =
   "Commands:\n" +
   "/sessions – list recent sessions, tap to connect\n" +
+  "/switch <id> – connect to any session by short or full id\n" +
   "/new – start a fresh session (in $HOME)\n" +
   "/status – current connection\n" +
   "/compact – compact the connected session\n" +
@@ -230,6 +231,50 @@ bot.callbackQuery("disconnect", async (ctx) => {
   try { await ctx.editMessageText("Disconnected."); } catch { /* ignore */ }
 });
 
+// /switch <id> — connect to any session by id (full UUID or short prefix,
+// 4+ chars). Walks every project dir on disk so you can resume sessions
+// older than the /sessions top-N. Disambiguates if a prefix matches more
+// than one session. The short id shown in every reply header is what the
+// user will most often paste back here.
+bot.command("switch", async (ctx) => {
+  const arg = (ctx.match ?? "").trim();
+  if (!arg) {
+    await ctx.reply("Usage: /switch <id>\nThe id can be the 8-char short form (shown in reply headers) or the full UUID.");
+    return;
+  }
+  if (arg.length < 4) {
+    await ctx.reply("Id must be at least 4 characters to avoid collisions.");
+    return;
+  }
+
+  const matches = await findSessionsByPrefix(arg);
+  if (matches.length === 0) {
+    const m = fmt`No session found with id starting with ${code}${arg}${code}.`;
+    await ctx.reply(m.text, { entities: m.entities });
+    return;
+  }
+  if (matches.length > 1) {
+    const lines: FormattedString[] = [
+      fmt`${b}Ambiguous${b} — ${String(matches.length)} sessions match ${code}${arg}${code}:`,
+    ];
+    for (const m of matches.slice(0, 10)) {
+      lines.push(fmt`\n• ${code}${m.sessionId}${code} · ${b}${m.project}${b} · ${age(m.mtime)}`);
+    }
+    if (matches.length > 10) lines.push(fmt`\n…and ${String(matches.length - 10)} more`);
+    lines.push(fmt`\n\nRetry with a longer prefix or the full id.`);
+    let body = lines[0];
+    for (let k = 1; k < lines.length; k++) body = fmt`${body}${lines[k]}`;
+    await ctx.reply(body.text, { entities: body.entities });
+    return;
+  }
+
+  const target = matches[0];
+  await setActiveSession(target.sessionId, target.cwd);
+  pendingNewCwd = null; // any pending /new is voided by an explicit switch
+  const m = fmt`Connected to ${code}${shortSid(target.sessionId)}${code} · ${b}${target.project}${b}\n${i}in ${i}${code}${target.cwd}${code}`;
+  await ctx.reply(m.text, { entities: m.entities });
+});
+
 // Resolve the connected session + cwd, replying with a helpful error and
 // returning null if not connected. Shared by text and photo handlers.
 async function resolveTarget(ctx: Context): Promise<{ sid: string; cwd: string } | null> {
@@ -402,6 +447,7 @@ export async function sendAgentReply(
 export async function registerCommandMenu(): Promise<void> {
   await bot.api.setMyCommands([
     { command: "sessions",   description: "List recent sessions, tap to connect" },
+    { command: "switch",     description: "Connect to any session by id" },
     { command: "new",        description: "Start a fresh session in $HOME" },
     { command: "status",     description: "Show current connection" },
     { command: "compact",    description: "Compact the connected session" },
