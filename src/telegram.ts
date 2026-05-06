@@ -13,7 +13,9 @@ import { config } from "./config.js";
 import { listRecentSessions, findSessionCwd, getSessionStats } from "./sessions.js";
 import { age, shortSid, truncate, formatTokens } from "./format.js";
 import { loadState, saveState } from "./state.js";
-import { enqueueInbound } from "./inbound.js";
+import { enqueueInbound, cancelActive } from "./inbound.js";
+import { renderTaskBoard } from "./tasksView.js";
+import { listProjectFolders } from "./projects.js";
 import {
   markdownToTelegramBlocks,
   packBlocks,
@@ -46,13 +48,23 @@ async function ack(ctx: Context): Promise<void> {
 const HELP_TEXT =
   "Commands:\n" +
   "/sessions – list recent sessions, tap to connect\n" +
+  "/new – start a fresh session in a chosen folder\n" +
   "/status – current connection\n" +
   "/compact – compact the connected session\n" +
+  "/cancel – stop the in-flight turn and drain the queue\n" +
+  "/tasks – read-only view of the task board\n" +
   "/disconnect – stop following\n" +
   "/help – this message\n\n" +
   "Plain text → piped into the connected session as a user message.\n" +
   "Photos → downloaded and shown to the session via its Read tool.\n" +
   "Back-to-back messages queue rather than overlap.";
+
+// Pending /new flow: when the user picks a folder via the /new keyboard, we
+// stash the cwd here. The next free-text message starts a fresh session in
+// that folder (instead of being routed to the connected session) and clears
+// the slot. In-memory only — a bridge restart drops the pending state, which
+// is fine: the user just reissues /new.
+let pendingNewCwd: string | null = null;
 
 bot.command("start", async (ctx) => {
   await ctx.reply(
@@ -112,6 +124,71 @@ bot.command("compact", async (ctx) => {
     targetSessionId: target.sid,
     targetCwd: target.cwd,
   });
+});
+
+// Stop the in-flight turn (if any) and drop everything still queued. The
+// queue is single-flight, so this is enough to interrupt Claude. Reports
+// what was cancelled.
+bot.command("cancel", async (ctx) => {
+  const { cancelledInFlight, queueDrained } = cancelActive();
+  if (!cancelledInFlight && queueDrained === 0) {
+    await ctx.reply("Nothing in flight to cancel.");
+    return;
+  }
+  const parts: string[] = [];
+  if (cancelledInFlight) parts.push("cancelled in-flight turn");
+  if (queueDrained > 0) parts.push(`dropped ${queueDrained} queued`);
+  await ctx.reply(`🛑 ${parts.join(", ")}.`);
+});
+
+// /new — pick a recent project folder, then your next plain-text message
+// starts a fresh session in that folder. Two-step so the keyboard fits
+// Telegram's UX (free-text with arg parsing would be uglier).
+bot.command("new", async (ctx) => {
+  const folders = await listProjectFolders(12);
+  if (folders.length === 0) {
+    await ctx.reply("No project folders found in ~/projects/.");
+    return;
+  }
+  const keyboard = new InlineKeyboard();
+  folders.forEach((f, idx) => {
+    keyboard.text(f.label, `newcwd:${f.path}`);
+    if (idx % 2 === 1) keyboard.row();
+  });
+  if (folders.length % 2 === 1) keyboard.row();
+  keyboard.text("✕ Cancel", "newcwd_cancel");
+  await ctx.reply("Pick a folder for the new session:", { reply_markup: keyboard });
+});
+
+bot.callbackQuery("newcwd_cancel", async (ctx) => {
+  pendingNewCwd = null;
+  await ctx.answerCallbackQuery();
+  try { await ctx.editMessageText("Cancelled."); } catch { /* ignore */ }
+});
+
+bot.callbackQuery(/^newcwd:(.+)$/, async (ctx) => {
+  const cwd = ctx.match[1];
+  pendingNewCwd = cwd;
+  await ctx.answerCallbackQuery();
+  const m = fmt`Send your first message — it'll start a fresh session in ${code}${cwd}${code}.`;
+  try {
+    await ctx.editMessageText(m.text, { entities: m.entities });
+  } catch {
+    await ctx.reply(m.text, { entities: m.entities });
+  }
+});
+
+// /tasks — read-only view of /home/clawd/tasks.json. Compact summary tuned
+// for phone reading: shows everything in active/plan/blocked/review, plus a
+// short top-of-todo preview and a count for the rest.
+bot.command("tasks", async (ctx) => {
+  try {
+    const text = await renderTaskBoard();
+    await ctx.reply(text, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+  } catch (e) {
+    console.error(`telegram: /tasks failed: ${(e as Error).message}`);
+    await ctx.reply(`⚠️ couldn't read task board: ${(e as Error).message}`);
+  }
 });
 
 bot.command("disconnect", async (ctx) => {
@@ -205,11 +282,28 @@ async function resolveTarget(ctx: Context): Promise<{ sid: string; cwd: string }
   return { sid, cwd };
 }
 
-// Free text → enqueue for the connected session.
+// Free text → enqueue for the connected session, OR start a new session if
+// the user just picked a folder via /new.
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text.trim();
   if (!text) return;
   if (text.startsWith("/")) return; // commands handled above
+
+  // /new follow-through: consume the pending cwd and route through the queue
+  // as a new-session job (targetSessionId = null tells inbound to spawn fresh).
+  if (pendingNewCwd) {
+    const cwd = pendingNewCwd;
+    pendingNewCwd = null;
+    await ack(ctx);
+    enqueueInbound({
+      text,
+      chatId: ctx.chat.id,
+      userMessageId: ctx.message.message_id,
+      targetSessionId: null,
+      targetCwd: cwd,
+    });
+    return;
+  }
 
   const target = await resolveTarget(ctx);
   if (!target) return;
@@ -283,6 +377,14 @@ bot.on("message:photo", async (ctx) => {
 export function getActiveSessionId(): string | null { return state.active_session_id; }
 export function getActiveCwd(): string | null { return state.active_cwd; }
 
+// Mutator used by the new-session path in inbound.ts. Sets and persists the
+// active connection so the Stop hook's POST is recognised as the active sid.
+export async function setActiveSession(sid: string, cwd: string): Promise<void> {
+  state = { active_session_id: sid, active_cwd: cwd };
+  await saveState(state);
+  console.log(`telegram: active session set sid=${shortSid(sid)} cwd=${cwd}`);
+}
+
 // Format an agent's Markdown reply as Telegram-HTML and send it to the
 // allowed chat. Handles chunking on safe block boundaries, prepends a small
 // session-identifying header to the first chunk, and falls back to plain
@@ -326,8 +428,11 @@ export async function sendAgentReply(
 export async function registerCommandMenu(): Promise<void> {
   await bot.api.setMyCommands([
     { command: "sessions",   description: "List recent sessions, tap to connect" },
+    { command: "new",        description: "Start a fresh session in a chosen folder" },
     { command: "status",     description: "Show current connection" },
     { command: "compact",    description: "Compact the connected session" },
+    { command: "cancel",     description: "Stop the in-flight turn and drain the queue" },
+    { command: "tasks",      description: "Read-only view of the task board" },
     { command: "disconnect", description: "Stop following the current session" },
     { command: "help",       description: "Show available commands" },
   ]);

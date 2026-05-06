@@ -9,7 +9,7 @@
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "./config.js";
-import { bot, getActiveSessionId } from "./telegram.js";
+import { bot, getActiveSessionId, setActiveSession } from "./telegram.js";
 import { shortSid, formatTokens } from "./format.js";
 import { claudeBinaryPath } from "./sdkBinary.js";
 import { createTelegramAttachServer } from "./telegramAttachTool.js";
@@ -32,11 +32,14 @@ function getTelegramMcpServer() {
   return _telegramMcpServer;
 }
 
+// `targetSessionId === null` flags a new-session job: query() runs without
+// `resume`, the SDK assigns a fresh session id, and the bridge captures it
+// from the first stream message and connects to it.
 export interface InboundJob {
   text: string;
   chatId: number;
   userMessageId: number;
-  targetSessionId: string;
+  targetSessionId: string | null;
   targetCwd: string;
 }
 
@@ -63,12 +66,29 @@ const TELEGRAM_NUDGE = [
 const queue: InboundJob[] = [];
 let running = false;
 
+// In-flight job's abort controller, exposed via cancelActive(). Set on entry
+// to each run* function, cleared in finally. Null when the worker is idle.
+let activeAbort: AbortController | null = null;
+
 export function enqueueInbound(job: InboundJob): void {
   queue.push(job);
-  console.log(
-    `inbound: queued depth=${queue.length} sid=${shortSid(job.targetSessionId)}`,
-  );
+  const label = job.targetSessionId ? shortSid(job.targetSessionId) : "new";
+  console.log(`inbound: queued depth=${queue.length} sid=${label}`);
   void drain();
+}
+
+// Cancel the currently-running turn (if any) and discard everything still
+// queued behind it. Returns counts so the caller can render a precise notice.
+// Idempotent — safe to call when the queue is idle.
+export function cancelActive(): { cancelledInFlight: boolean; queueDrained: number } {
+  const queueDrained = queue.length;
+  queue.length = 0;
+  let cancelledInFlight = false;
+  if (activeAbort) {
+    activeAbort.abort("user-cancel");
+    cancelledInFlight = true;
+  }
+  return { cancelledInFlight, queueDrained };
 }
 
 async function drain(): Promise<void> {
@@ -91,6 +111,12 @@ async function sendTyping(chatId: number): Promise<void> {
 }
 
 async function runJob(job: InboundJob): Promise<void> {
+  // New-session jobs run before any session id exists — skip the stale check
+  // and fork to the dedicated path that captures the SDK-assigned id.
+  if (job.targetSessionId === null) {
+    return runNewSessionJob(job);
+  }
+
   // Bail if the user disconnected or switched between enqueue and dequeue.
   const active = getActiveSessionId();
   if (active !== job.targetSessionId) {
@@ -101,7 +127,7 @@ async function runJob(job: InboundJob): Promise<void> {
   }
 
   if (job.text === COMPACT_SENTINEL) {
-    return runCompactJob(job);
+    return runCompactJob(job as InboundJob & { targetSessionId: string });
   }
 
   console.log(
@@ -115,12 +141,12 @@ async function runJob(job: InboundJob): Promise<void> {
 
   let result: ClaudeResult;
   try {
-    result = await runClaude(job);
+    result = await runClaude(job as InboundJob & { targetSessionId: string });
   } finally {
     clearInterval(typingInterval);
   }
 
-  if (result.code !== 0) {
+  if (result.code !== 0 && result.stderr !== "cancelled") {
     const errShort = result.stderr.length > 600
       ? result.stderr.slice(0, 600) + "…"
       : result.stderr;
@@ -134,14 +160,16 @@ async function runJob(job: InboundJob): Promise<void> {
     }
   }
   // On success: the Stop hook will deliver the reply via /stop. Nothing to do.
+  // On user-cancel: the /cancel handler already informed the user.
 }
 
-async function runClaude(job: InboundJob): Promise<ClaudeResult> {
+async function runClaude(job: InboundJob & { targetSessionId: string }): Promise<ClaudeResult> {
   const controller = new AbortController();
   const timer = setTimeout(
     () => controller.abort(),
     config.claudeTimeoutSec * 1000,
   );
+  activeAbort = controller;
 
   let exitCode = 0;
   let stderr = "";
@@ -190,11 +218,16 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
     }
   } catch (e) {
     exitCode = -1;
-    stderr = controller.signal.aborted
-      ? `timeout after ${config.claudeTimeoutSec}s`
-      : ((e as Error).stack ?? String(e));
+    if (controller.signal.aborted) {
+      stderr = controller.signal.reason === "user-cancel"
+        ? "cancelled"
+        : `timeout after ${config.claudeTimeoutSec}s`;
+    } else {
+      stderr = (e as Error).stack ?? String(e);
+    }
   } finally {
     clearTimeout(timer);
+    if (activeAbort === controller) activeAbort = null;
   }
 
   if (exitCode !== 0) {
@@ -226,7 +259,7 @@ interface CompactResult {
   error?: string;
 }
 
-async function runCompactJob(job: InboundJob): Promise<void> {
+async function runCompactJob(job: InboundJob & { targetSessionId: string }): Promise<void> {
   console.log(`inbound: compact sid=${shortSid(job.targetSessionId)}`);
 
   try {
@@ -248,6 +281,7 @@ async function runCompactJob(job: InboundJob): Promise<void> {
   }
 
   if (result.error) {
+    if (result.error === "cancelled") return; // /cancel handler already informed the user
     const errShort = result.error.length > 600 ? result.error.slice(0, 600) + "…" : result.error;
     try {
       await bot.api.sendMessage(job.chatId, `⚠️ Compaction failed: ${errShort}`);
@@ -275,12 +309,13 @@ async function runCompactJob(job: InboundJob): Promise<void> {
   }
 }
 
-async function runClaudeCompact(job: InboundJob): Promise<CompactResult> {
+async function runClaudeCompact(job: InboundJob & { targetSessionId: string }): Promise<CompactResult> {
   const controller = new AbortController();
   const timer = setTimeout(
     () => controller.abort(),
     config.claudeTimeoutSec * 1000,
   );
+  activeAbort = controller;
 
   const result: CompactResult = {};
   let sdkStderr = "";
@@ -318,11 +353,16 @@ async function runClaudeCompact(job: InboundJob): Promise<CompactResult> {
       }
     }
   } catch (e) {
-    result.error = controller.signal.aborted
-      ? `timeout after ${config.claudeTimeoutSec}s`
-      : ((e as Error).message ?? String(e));
+    if (controller.signal.aborted) {
+      result.error = controller.signal.reason === "user-cancel"
+        ? "cancelled"
+        : `timeout after ${config.claudeTimeoutSec}s`;
+    } else {
+      result.error = (e as Error).message ?? String(e);
+    }
   } finally {
     clearTimeout(timer);
+    if (activeAbort === controller) activeAbort = null;
   }
 
   if (result.error) {
@@ -338,4 +378,120 @@ async function runClaudeCompact(job: InboundJob): Promise<CompactResult> {
   }
 
   return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// /new path. Spawns a fresh Claude Code session in `targetCwd` (no resume),
+// captures the SDK-assigned session id from the first stream message, and
+// connects to it so the Stop hook's reply lands in Telegram normally.
+
+async function runNewSessionJob(job: InboundJob): Promise<void> {
+  console.log(`inbound: new-session cwd=${job.targetCwd} bytes=${job.text.length}`);
+
+  await sendTyping(job.chatId);
+  const typingInterval = setInterval(() => void sendTyping(job.chatId), 4000);
+
+  let result: ClaudeResult;
+  try {
+    result = await runClaudeNew(job);
+  } finally {
+    clearInterval(typingInterval);
+  }
+
+  if (result.code !== 0 && result.stderr !== "cancelled") {
+    const errShort = result.stderr.length > 600
+      ? result.stderr.slice(0, 600) + "…"
+      : result.stderr;
+    const message = `⚠️ couldn't start session\n${errShort || "(no stderr)"}`;
+    try {
+      await bot.api.sendMessage(job.chatId, message, {
+        reply_parameters: { message_id: job.userMessageId },
+      });
+    } catch (e) {
+      console.error(`inbound: failed to report new-session error: ${(e as Error).message}`);
+    }
+  }
+}
+
+async function runClaudeNew(job: InboundJob): Promise<ClaudeResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(),
+    config.claudeTimeoutSec * 1000,
+  );
+  activeAbort = controller;
+
+  let exitCode = 0;
+  let stderr = "";
+  let sdkStderr = "";
+  let capturedSid: string | null = null;
+
+  try {
+    const q = query({
+      prompt: job.text,
+      options: {
+        // No `resume` — the SDK assigns a fresh session id.
+        cwd: job.targetCwd,
+        permissionMode: "bypassPermissions",
+        allowDangerouslySkipPermissions: true,
+        abortController: controller,
+        includePartialMessages: false,
+        pathToClaudeCodeExecutable: claudeBinaryPath,
+        systemPrompt: { type: "preset", preset: "claude_code", append: TELEGRAM_NUDGE },
+        mcpServers: { telegram: getTelegramMcpServer() },
+        stderr: (line: string) => { sdkStderr += line; },
+      },
+    });
+
+    for await (const msg of q) {
+      // Connect as soon as the SDK assigns the new session id, so the Stop
+      // hook's POST (which fires after the result message) finds the active
+      // pointer set and forwards to Telegram.
+      if (!capturedSid && (msg as { session_id?: string }).session_id) {
+        capturedSid = (msg as { session_id: string }).session_id;
+        await setActiveSession(capturedSid, job.targetCwd);
+        try {
+          await bot.api.sendMessage(
+            job.chatId,
+            `🆕 Started session ${shortSid(capturedSid)} in ${job.targetCwd}`,
+          );
+        } catch (e) {
+          console.error(`inbound: failed to send new-session notice: ${(e as Error).message}`);
+        }
+      }
+      if (msg.type === "result") {
+        const r = msg as { subtype?: string; is_error?: boolean; errors?: string[] };
+        if (r.subtype && r.subtype !== "success") {
+          exitCode = -1;
+          const detail = r.is_error ? (r.errors ?? []).join("; ") : "";
+          stderr = `result subtype=${r.subtype}${detail ? ` — ${detail}` : ""}`;
+        }
+      }
+    }
+  } catch (e) {
+    exitCode = -1;
+    if (controller.signal.aborted) {
+      stderr = controller.signal.reason === "user-cancel"
+        ? "cancelled"
+        : `timeout after ${config.claudeTimeoutSec}s`;
+    } else {
+      stderr = (e as Error).stack ?? String(e);
+    }
+  } finally {
+    clearTimeout(timer);
+    if (activeAbort === controller) activeAbort = null;
+  }
+
+  if (exitCode !== 0) {
+    console.error(
+      `inbound: new-session failed cwd=${job.targetCwd} code=${exitCode} stderr=${stderr}` +
+      (sdkStderr ? ` sdk_stderr=${sdkStderr.replace(/\s+/g, " ").slice(0, 1000)}` : ""),
+    );
+  } else {
+    console.log(
+      `inbound: new-session ok sid=${capturedSid ? shortSid(capturedSid) : "?"} cwd=${job.targetCwd}`,
+    );
+  }
+
+  return { code: exitCode, stderr };
 }
