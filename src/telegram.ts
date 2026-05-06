@@ -48,7 +48,7 @@ async function ack(ctx: Context): Promise<void> {
 const HELP_TEXT =
   "Commands:\n" +
   "/sessions – list recent sessions, tap to connect\n" +
-  "/switch <id> – connect to any session by short or full id\n" +
+  "/switch [id] – connect to any session by id (or call bare to be prompted)\n" +
   "/new – start a fresh session (in $HOME)\n" +
   "/status – current connection\n" +
   "/compact – compact the connected session\n" +
@@ -66,6 +66,12 @@ const HELP_TEXT =
 // the slot. In-memory only — a bridge restart drops the pending state, which
 // is fine: the user just reissues /new.
 let pendingNewCwd: string | null = null;
+
+// Pending /switch flow: when the user fires bare /switch (so they can tap it
+// from the slash-command menu without typing), the next free-text message is
+// treated as the session id to switch to. Mutually exclusive with
+// pendingNewCwd — setting one clears the other.
+let pendingSwitch = false;
 
 bot.command("start", async (ctx) => {
   await ctx.reply(
@@ -149,6 +155,7 @@ bot.command("cancel", async (ctx) => {
 bot.command("new", async (ctx) => {
   const cwd = homedir();
   pendingNewCwd = cwd;
+  pendingSwitch = false;
   const m = fmt`Send your first message — it'll start a fresh session in ${code}${cwd}${code}.`;
   await ctx.reply(m.text, { entities: m.entities });
 });
@@ -231,17 +238,31 @@ bot.callbackQuery("disconnect", async (ctx) => {
   try { await ctx.editMessageText("Disconnected."); } catch { /* ignore */ }
 });
 
-// /switch <id> — connect to any session by id (full UUID or short prefix,
+// /switch [id] — connect to any session by id (full UUID or short prefix,
 // 4+ chars). Walks every project dir on disk so you can resume sessions
 // older than the /sessions top-N. Disambiguates if a prefix matches more
 // than one session. The short id shown in every reply header is what the
 // user will most often paste back here.
+//
+// Two-step variant: bare /switch arms `pendingSwitch`, then the next
+// free-text message is treated as the id. Lets the user tap /switch from
+// the slash-command menu without typing the command first.
 bot.command("switch", async (ctx) => {
   const arg = (ctx.match ?? "").trim();
   if (!arg) {
-    await ctx.reply("Usage: /switch <id>\nThe id can be the 8-char short form (shown in reply headers) or the full UUID.");
+    pendingSwitch = true;
+    pendingNewCwd = null;
+    await ctx.reply("Send the session id (8-char short form or full UUID).");
     return;
   }
+  await performSwitch(ctx, arg);
+});
+
+// Look up `arg` as a session-id prefix and act on the result. Replies with
+// the appropriate connection notice, ambiguity list, or not-found message.
+// Shared by the bot.command("switch") arg path and the pendingSwitch path
+// in message:text.
+async function performSwitch(ctx: Context, arg: string): Promise<void> {
   if (arg.length < 4) {
     await ctx.reply("Id must be at least 4 characters to avoid collisions.");
     return;
@@ -273,7 +294,7 @@ bot.command("switch", async (ctx) => {
   pendingNewCwd = null; // any pending /new is voided by an explicit switch
   const m = fmt`Connected to ${code}${shortSid(target.sessionId)}${code} · ${b}${target.project}${b}\n${i}in ${i}${code}${target.cwd}${code}`;
   await ctx.reply(m.text, { entities: m.entities });
-});
+}
 
 // Resolve the connected session + cwd, replying with a helpful error and
 // returning null if not connected. Shared by text and photo handlers.
@@ -301,12 +322,20 @@ async function resolveTarget(ctx: Context): Promise<{ sid: string; cwd: string }
   return { sid, cwd };
 }
 
-// Free text → enqueue for the connected session, OR start a new session if
-// the user just picked a folder via /new.
+// Free text → enqueue for the connected session, OR consume a pending
+// /switch / /new follow-through.
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text.trim();
   if (!text) return;
   if (text.startsWith("/")) return; // commands handled above
+
+  // /switch follow-through: bare /switch armed pendingSwitch, this message
+  // is the id. Consume and dispatch.
+  if (pendingSwitch) {
+    pendingSwitch = false;
+    await performSwitch(ctx, text);
+    return;
+  }
 
   // /new follow-through: consume the pending cwd and route through the queue
   // as a new-session job (targetSessionId = null tells inbound to spawn fresh).
