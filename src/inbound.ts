@@ -1,22 +1,15 @@
 // Inbound queue: Telegram free text → connected Claude session via the
 // `@anthropic-ai/claude-agent-sdk` query() API.
 //
-// For bridge-driven turns we forward the assistant reply DIRECTLY from here,
-// using the SDK's own end-of-turn signal (the iterator finishing). This is
-// race-free — we have the full assistant text in memory by the time the SDK
-// says "done", so we don't need to round-trip through the JSONL transcript
-// + Stop hook.
-//
-// The Stop hook → /stop path still exists for any turn that didn't originate
-// from the bridge (e.g. a session being driven from agent-ui directly).
-// `isBridgeHandling()` lets the intake suppress double-forwards while we own
-// the turn.
+// We only DRIVE the agent here (inject the user's text). Delivery back to
+// Telegram is owned exclusively by the Stop hook → /stop intake path —
+// every assistant turn ends with a Stop hook fire that carries the assistant
+// text in-band, so external turns and bridge-driven turns share a single
+// delivery channel. This module only surfaces failures.
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import path from "node:path";
-import os from "node:os";
 import { config } from "./config.js";
-import { bot, getActiveSessionId, sendAgentReply } from "./telegram.js";
+import { bot, getActiveSessionId } from "./telegram.js";
 import { shortSid } from "./format.js";
 import { claudeBinaryPath } from "./sdkBinary.js";
 
@@ -30,7 +23,6 @@ export interface InboundJob {
 
 interface ClaudeResult {
   code: number;
-  stdout: string;
   stderr: string;
 }
 
@@ -47,14 +39,6 @@ const TELEGRAM_NUDGE = [
   "- Use bold / italics / inline code sparingly, only for genuine emphasis.",
 ].join("\n");
 
-// Sessions for which the bridge is currently producing a reply (or just did).
-// Stored as deadline timestamps: while Date.now() < deadline, intake should
-// drop Stop-hook payloads to avoid double-forwarding. Using deadlines (not
-// timers) avoids a race where a tail timer from job N fires mid-job N+1.
-const suppressUntil = new Map<string, number>();
-const RUN_GUARD_MS = 60 * 60 * 1000; // upper bound while a job is running
-const TAIL_GUARD_MS = 8000;          // window to absorb the trailing Stop hook
-
 const queue: InboundJob[] = [];
 let running = false;
 
@@ -64,20 +48,6 @@ export function enqueueInbound(job: InboundJob): void {
     `inbound: queued depth=${queue.length} sid=${shortSid(job.targetSessionId)}`,
   );
   void drain();
-}
-
-export function isBridgeHandling(sid: string): boolean {
-  const until = suppressUntil.get(sid);
-  if (until === undefined) return false;
-  if (Date.now() >= until) {
-    suppressUntil.delete(sid);
-    return false;
-  }
-  return true;
-}
-
-function suppressFor(sid: string, ms: number): void {
-  suppressUntil.set(sid, Date.now() + ms);
 }
 
 async function drain(): Promise<void> {
@@ -99,11 +69,6 @@ async function sendTyping(chatId: number): Promise<void> {
   try { await bot.api.sendChatAction(chatId, "typing"); } catch { /* ignore */ }
 }
 
-function projectLabel(cwd: string): string {
-  return cwd === os.homedir() ? "~" : path.basename(cwd);
-}
-
-
 async function runJob(job: InboundJob): Promise<void> {
   // Bail if the user disconnected or switched between enqueue and dequeue.
   const active = getActiveSessionId();
@@ -118,11 +83,6 @@ async function runJob(job: InboundJob): Promise<void> {
     `inbound: query sid=${shortSid(job.targetSessionId)} cwd=${job.targetCwd} bytes=${job.text.length}`,
   );
 
-  // Suppress Stop-hook forwards for this sid for the entire run, then a tail
-  // window past completion. Each phase pushes the deadline forward so back-
-  // to-back jobs never fall through a stale-timer gap.
-  suppressFor(job.targetSessionId, RUN_GUARD_MS);
-
   // Show "typing…" indicator, refresh every 4s until claude finishes
   // (Telegram's typing action expires after 5s).
   await sendTyping(job.chatId);
@@ -135,23 +95,7 @@ async function runJob(job: InboundJob): Promise<void> {
     clearInterval(typingInterval);
   }
 
-  if (result.code === 0) {
-    const reply = result.stdout.trim();
-    if (reply) {
-      try {
-        await sendAgentReply(job.targetSessionId, projectLabel(job.targetCwd), reply);
-        console.log(
-          `inbound: forwarded sid=${shortSid(job.targetSessionId)} bytes=${reply.length}`,
-        );
-      } catch (e) {
-        console.error(
-          `inbound: forward failed sid=${shortSid(job.targetSessionId)}: ${(e as Error).message}`,
-        );
-      }
-    } else {
-      console.log(`inbound: empty reply sid=${shortSid(job.targetSessionId)}`);
-    }
-  } else {
+  if (result.code !== 0) {
     const errShort = result.stderr.length > 600
       ? result.stderr.slice(0, 600) + "…"
       : result.stderr;
@@ -164,9 +108,7 @@ async function runJob(job: InboundJob): Promise<void> {
       console.error(`inbound: failed to report error to telegram: ${(e as Error).message}`);
     }
   }
-
-  // Tail window past completion to absorb the lagging Stop hook fire.
-  suppressFor(job.targetSessionId, TAIL_GUARD_MS);
+  // On success: the Stop hook will deliver the reply via /stop. Nothing to do.
 }
 
 async function runClaude(job: InboundJob): Promise<ClaudeResult> {
@@ -176,7 +118,6 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
     config.claudeTimeoutSec * 1000,
   );
 
-  let assistantText = "";
   let exitCode = 0;
   let stderr = "";
   let sdkStderr = "";
@@ -206,16 +147,10 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
       },
     });
 
+    // Drain the iterator — we don't read its text (the Stop hook delivers
+    // that), but we do need the `result` message to detect failures.
     for await (const msg of q) {
-      if (msg.type === "assistant") {
-        const content = (msg as { message?: { content?: Array<{ type: string; text?: string }> } })
-          .message?.content ?? [];
-        for (const blk of content) {
-          if (blk.type === "text" && typeof blk.text === "string") {
-            assistantText += blk.text;
-          }
-        }
-      } else if (msg.type === "result") {
+      if (msg.type === "result") {
         const r = msg as { subtype?: string; is_error?: boolean; errors?: string[] };
         if (r.subtype && r.subtype !== "success") {
           exitCode = -1;
@@ -245,5 +180,5 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
     );
   }
 
-  return { code: exitCode, stdout: assistantText, stderr };
+  return { code: exitCode, stderr };
 }

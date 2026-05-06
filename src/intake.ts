@@ -7,7 +7,6 @@ import http from "node:http";
 import { config } from "./config.js";
 import { getActiveSessionId, sendAgentReply } from "./telegram.js";
 import { shortSid } from "./format.js";
-import { isBridgeHandling } from "./inbound.js";
 
 const HOST = "127.0.0.1";
 
@@ -78,15 +77,6 @@ export function startIntake(): http.Server {
       if (!text) {
         console.log(`intake: empty text sid=${shortSid(sessionId)}`);
         send(res, 202, { ok: true, forwarded: false, reason: "empty text" });
-        return;
-      }
-
-      // The bridge owns delivery for any turn it kicked off via the SDK. The
-      // Stop hook still fires in that case but reads stale JSONL — drop it
-      // here so the user doesn't see a delayed/wrong duplicate.
-      if (isBridgeHandling(sessionId)) {
-        console.log(`intake: drop sid=${shortSid(sessionId)} (bridge handling)`);
-        send(res, 202, { ok: true, forwarded: false, reason: "bridge handling" });
         return;
       }
 
