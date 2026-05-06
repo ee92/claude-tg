@@ -7,8 +7,8 @@ import { fmt, b, i, code, FormattedString } from "@grammyjs/parse-mode";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { config } from "./config.js";
-import { listRecentSessions, findSessionCwd } from "./sessions.js";
-import { age, shortSid, truncate } from "./format.js";
+import { listRecentSessions, findSessionCwd, getSessionStats } from "./sessions.js";
+import { age, shortSid, truncate, formatTokens } from "./format.js";
 import { loadState, saveState } from "./state.js";
 import { enqueueInbound } from "./inbound.js";
 
@@ -64,9 +64,24 @@ bot.command("status", async (ctx) => {
     await ctx.reply("Not connected to any session.\nUse /sessions to pick one.");
     return;
   }
-  const msg = cwd
-    ? fmt`Connected to session ${code}${shortSid(sid)}${code}\n${i}in ${i}${code}${cwd}${code}\n(full id: ${code}${sid}${code})`
-    : fmt`Connected to session ${code}${shortSid(sid)}${code}\n(full id: ${code}${sid}${code})`;
+
+  // Best-effort transcript stats — fall back gracefully if the file isn't found.
+  const stats = await getSessionStats(sid).catch(() => null);
+
+  const head = cwd
+    ? fmt`Connected to session ${code}${shortSid(sid)}${code}\n${i}in ${i}${code}${cwd}${code}`
+    : fmt`Connected to session ${code}${shortSid(sid)}${code}`;
+
+  let msg = head;
+  if (stats) {
+    if (stats.model) msg = fmt`${msg}\n${b}model${b}: ${code}${stats.model}${code}`;
+    if (stats.contextTokens != null) {
+      msg = fmt`${msg}\n${b}context${b}: ${formatTokens(stats.contextTokens)} tokens (last turn)`;
+    }
+    msg = fmt`${msg}\n${b}user messages${b}: ${String(stats.userMessageCount)}`;
+  }
+  msg = fmt`${msg}\n(full id: ${code}${sid}${code})`;
+
   await ctx.reply(msg.text, { entities: msg.entities });
 });
 
@@ -250,4 +265,15 @@ export async function registerCommandMenu(): Promise<void> {
     { command: "help",     description: "Show available commands" },
   ]);
   console.log("telegram: command menu registered");
+}
+
+// Post a one-line "bridge online" notice to the allowed chat on every startup.
+// Sent as a plain Telegram message (not piped into the connected session), so
+// daemon-restart events stay out of the conversation transcript.
+export async function sendStartupNotice(): Promise<void> {
+  const sid = state.active_session_id;
+  const head = sid
+    ? fmt`🔄 ${b}bridge online${b} — connected to ${code}${shortSid(sid)}${code}`
+    : fmt`🔄 ${b}bridge online${b} — no session connected`;
+  await bot.api.sendMessage(config.allowedChatId, head.text, { entities: head.entities });
 }

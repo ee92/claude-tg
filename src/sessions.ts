@@ -126,3 +126,90 @@ export async function findSessionCwd(sid: string): Promise<string | null> {
   const recent = await listRecentSessions(50);
   return recent.find((s) => s.sessionId === sid)?.cwd ?? null;
 }
+
+// /status enrichment — model, last-turn context size, and count of user-typed
+// messages. Walks all project dirs to locate <sid>.jsonl, then linear-scans.
+export interface SessionStats {
+  model: string | null;
+  // Sum of input + cache_read + cache_creation tokens on the latest assistant
+  // turn — i.e. the prompt size of the most recent round-trip. Not the same
+  // as "context size of the next turn", but a close enough proxy.
+  contextTokens: number | null;
+  userMessageCount: number;
+}
+
+interface AssistantEntry extends JsonlEntry {
+  message?: {
+    content?: unknown;
+    model?: string;
+    usage?: {
+      input_tokens?: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+    };
+  };
+}
+
+async function findTranscriptPath(sid: string): Promise<string | null> {
+  let projDirs: string[];
+  try { projDirs = await fs.readdir(PROJECTS_DIR); } catch { return null; }
+  const target = `${sid}.jsonl`;
+  for (const proj of projDirs) {
+    const p = join(PROJECTS_DIR, proj, target);
+    try { await fs.access(p); return p; } catch { /* not in this dir */ }
+  }
+  return null;
+}
+
+export async function getSessionStats(sid: string): Promise<SessionStats | null> {
+  const path = await findTranscriptPath(sid);
+  if (!path) return null;
+  let text: string;
+  try { text = await fs.readFile(path, "utf8"); } catch { return null; }
+  const lines = text.split("\n");
+
+  let model: string | null = null;
+  let contextTokens: number | null = null;
+
+  // Reverse scan for the most recent assistant entry that carries usage.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    let obj: AssistantEntry;
+    try { obj = JSON.parse(line) as AssistantEntry; } catch { continue; }
+    if (obj.type !== "assistant") continue;
+    const u = obj.message?.usage;
+    if (!u) continue;
+    model = obj.message?.model ?? null;
+    contextTokens =
+      (u.input_tokens ?? 0) +
+      (u.cache_read_input_tokens ?? 0) +
+      (u.cache_creation_input_tokens ?? 0);
+    break;
+  }
+
+  // Forward scan to count user-typed messages (excluding tool_result entries).
+  let userMessageCount = 0;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let obj: JsonlEntry;
+    try { obj = JSON.parse(line) as JsonlEntry; } catch { continue; }
+    if (obj.type !== "user") continue;
+    const c = obj.message?.content;
+    if (typeof c === "string") { userMessageCount++; continue; }
+    if (Array.isArray(c)) {
+      let hasToolResult = false;
+      let hasText = false;
+      for (const block of c) {
+        if (block && typeof block === "object") {
+          const t = (block as { type?: string }).type;
+          if (t === "tool_result") { hasToolResult = true; break; }
+          if (t === "text") hasText = true;
+        }
+      }
+      if (!hasToolResult && hasText) userMessageCount++;
+    }
+  }
+
+  return { model, contextTokens, userMessageCount };
+}

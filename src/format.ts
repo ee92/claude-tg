@@ -18,3 +18,10 @@ export function truncate(s: string, n: number): string {
   if (collapsed.length <= n) return collapsed;
   return collapsed.slice(0, n - 1).trimEnd() + "…";
 }
+
+// "1234" → "1.2K", "1234567" → "1.2M". For token counts in /status.
+export function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}K`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
+}
