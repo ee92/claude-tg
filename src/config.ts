@@ -27,6 +27,5 @@ export const config = {
     process.exit(1);
   })(),
   intakePort: intEnv("INTAKE_PORT", 8765),
-  claudeBin: process.env.CLAUDE_BIN?.trim() || "/usr/bin/claude",
   claudeTimeoutSec: intEnv("CLAUDE_TIMEOUT_SEC", 600),
 } as const;
