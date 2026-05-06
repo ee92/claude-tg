@@ -12,7 +12,7 @@
 // `isBridgeHandling()` lets the intake suppress double-forwards while we own
 // the turn.
 
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { fmt, b, code } from "@grammyjs/parse-mode";
 import path from "node:path";
 import os from "node:os";
@@ -20,13 +20,37 @@ import { config } from "./config.js";
 import { bot, getActiveSessionId } from "./telegram.js";
 import { shortSid } from "./format.js";
 
-interface InboundJob {
-  text: string;
+export type ImageMediaType =
+  | "image/jpeg"
+  | "image/png"
+  | "image/gif"
+  | "image/webp";
+
+export interface InboundJob {
+  // Exactly one of these must be set.
+  text?: string;
+  photo?: {
+    mediaType: ImageMediaType;
+    bytes: Buffer;
+    caption?: string;
+  };
+
   chatId: number;
   userMessageId: number;
   targetSessionId: string;
   targetCwd: string;
 }
+
+// Structural shape of the user-message content blocks we hand to the SDK. The
+// SDK accepts these because they're structurally identical to Anthropic's
+// ContentBlockParam union; we keep our own narrow type so we don't have to
+// pull in @anthropic-ai/sdk transitively.
+type ContentBlock =
+  | { type: "text"; text: string }
+  | {
+      type: "image";
+      source: { type: "base64"; media_type: ImageMediaType; data: string };
+    };
 
 const queue: InboundJob[] = [];
 let running = false;
@@ -84,6 +108,38 @@ function projectLabel(cwd: string): string {
   return cwd === os.homedir() ? "~" : path.basename(cwd);
 }
 
+function describePayload(job: InboundJob): string {
+  if (job.text != null) return `text bytes=${job.text.length}`;
+  if (job.photo) {
+    const cap = job.photo.caption ? ` caption=${job.photo.caption.length}` : "";
+    return `photo ${job.photo.mediaType} bytes=${job.photo.bytes.length}${cap}`;
+  }
+  return "(empty payload)";
+}
+
+function buildContent(job: InboundJob): ContentBlock[] {
+  if (job.text != null) {
+    return [{ type: "text", text: job.text }];
+  }
+  if (job.photo) {
+    const blocks: ContentBlock[] = [
+      {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: job.photo.mediaType,
+          data: job.photo.bytes.toString("base64"),
+        },
+      },
+    ];
+    if (job.photo.caption) {
+      blocks.push({ type: "text", text: job.photo.caption });
+    }
+    return blocks;
+  }
+  throw new Error("InboundJob has neither text nor photo payload");
+}
+
 const BODY_CAP = 3500;
 
 async function forwardReply(sessionId: string, projLabel: string, text: string): Promise<void> {
@@ -106,7 +162,7 @@ async function runJob(job: InboundJob): Promise<void> {
   }
 
   console.log(
-    `inbound: query sid=${shortSid(job.targetSessionId)} cwd=${job.targetCwd} bytes=${job.text.length}`
+    `inbound: query sid=${shortSid(job.targetSessionId)} cwd=${job.targetCwd} ${describePayload(job)}`
   );
 
   // Suppress Stop-hook forwards for this sid for the entire run, then a tail
@@ -161,6 +217,16 @@ async function runJob(job: InboundJob): Promise<void> {
 
 interface ClaudeResult { code: number; stdout: string; stderr: string; }
 
+async function* singleUserMessage(
+  content: ContentBlock[],
+): AsyncIterable<SDKUserMessage> {
+  yield {
+    type: "user",
+    message: { role: "user", content },
+    parent_tool_use_id: null,
+  } as SDKUserMessage;
+}
+
 async function runClaude(job: InboundJob): Promise<ClaudeResult> {
   const controller = new AbortController();
   const timer = setTimeout(
@@ -173,8 +239,12 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
   let stderr = "";
 
   try {
+    const content = buildContent(job);
+    // The SDK's prompt accepts an AsyncIterable<SDKUserMessage> for multimodal
+    // input. Structurally compatible: `parent_tool_use_id: null` plus a single
+    // user message with text + image content blocks.
     const q = query({
-      prompt: job.text,
+      prompt: singleUserMessage(content),
       options: {
         resume: job.targetSessionId,
         cwd: job.targetCwd,
