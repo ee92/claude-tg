@@ -4,29 +4,17 @@
 // All code paths log INFO so a missing message has a breadcrumb trail.
 
 import http from "node:http";
-import { fmt, b, code } from "@grammyjs/parse-mode";
 import { config } from "./config.js";
-import { bot, getActiveSessionId } from "./telegram.js";
+import { getActiveSessionId, sendAgentReply } from "./telegram.js";
 import { shortSid } from "./format.js";
 import { isBridgeHandling } from "./inbound.js";
 
 const HOST = "127.0.0.1";
-const BODY_CAP = 3500;
 
 interface StopPayload {
   session_id?: string;
   text?: string;
   project?: string;
-}
-
-async function forwardToTelegram(sessionId: string, project: string, text: string): Promise<void> {
-  const body = text.length <= BODY_CAP ? text : text.slice(0, BODY_CAP).trimEnd() + "\n…(truncated)";
-  const projLabel = project || "?";
-  const msg = fmt`${b}${projLabel}${b} · ${code}${shortSid(sessionId)}${code}\n\n${body}`;
-  await bot.api.sendMessage(config.allowedChatId, msg.text, {
-    entities: msg.entities,
-    link_preview_options: { is_disabled: true },
-  });
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -103,7 +91,7 @@ export function startIntake(): http.Server {
       }
 
       try {
-        await forwardToTelegram(sessionId, project, text);
+        await sendAgentReply(sessionId, project, text);
         console.log(`intake: forwarded sid=${shortSid(sessionId)} bytes=${text.length}`);
         send(res, 202, { ok: true, forwarded: true });
       } catch (e) {

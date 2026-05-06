@@ -1,6 +1,9 @@
 // grammY bot wiring. All handlers gated on the configured chat id.
-// MarkdownV2 escapes are handled by the parse-mode plugin's `fmt` template tag,
-// so dynamic strings (project names, summaries) cannot break the parser.
+//
+// System messages (status, sessions list, startup notice) use the parse-mode
+// plugin's `fmt` template tag, which handles MarkdownV2 escaping for us.
+// Agent replies route through sendAgentReply, which converts the model's
+// Markdown output to Telegram-HTML via ./telegramHtml.
 
 import { Bot, Context, InlineKeyboard } from "grammy";
 import { fmt, b, i, code, FormattedString } from "@grammyjs/parse-mode";
@@ -11,6 +14,13 @@ import { listRecentSessions, findSessionCwd, getSessionStats } from "./sessions.
 import { age, shortSid, truncate, formatTokens } from "./format.js";
 import { loadState, saveState } from "./state.js";
 import { enqueueInbound } from "./inbound.js";
+import {
+  markdownToTelegramBlocks,
+  packBlocks,
+  stripTelegramHtml,
+  escHtml,
+  TELEGRAM_SAFE_CAP,
+} from "./telegramHtml.js";
 
 const SESSION_LIST_LIMIT = 10;
 const UPLOAD_DIR = "/tmp/claudesworth-uploads";
@@ -253,6 +263,43 @@ bot.on("message:photo", async (ctx) => {
 // Read accessors for other modules.
 export function getActiveSessionId(): string | null { return state.active_session_id; }
 export function getActiveCwd(): string | null { return state.active_cwd; }
+
+// Format an agent's Markdown reply as Telegram-HTML and send it to the
+// allowed chat. Handles chunking on safe block boundaries, prepends a small
+// session-identifying header to the first chunk, and falls back to plain
+// text if Telegram rejects the formatted send. Shared between the SDK-driven
+// (inbound.ts) and Stop-hook-driven (intake.ts) forward paths.
+export async function sendAgentReply(
+  sessionId: string,
+  projectLabel: string,
+  text: string,
+): Promise<void> {
+  const header = `<b>${escHtml(projectLabel || "?")}</b> · <code>${escHtml(shortSid(sessionId))}</code>`;
+  const blocks = markdownToTelegramBlocks(text);
+  // Defensive: if marked produced no blocks (highly unusual), fall back to
+  // the raw text escaped, so we still send something.
+  const contentBlocks = blocks.length > 0 ? blocks : [escHtml(text)];
+  const chunks = packBlocks([header, ...contentBlocks], TELEGRAM_SAFE_CAP);
+
+  for (const chunk of chunks) {
+    try {
+      await bot.api.sendMessage(config.allowedChatId, chunk, {
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+      });
+    } catch (e) {
+      // Telegram rejected the formatted send (unsupported tag, malformed
+      // entity). Retry with tags stripped so the content still reaches
+      // the user.
+      console.warn(
+        `telegram: HTML send rejected sid=${shortSid(sessionId)}: ${(e as Error).message}; retrying plain`,
+      );
+      await bot.api.sendMessage(config.allowedChatId, stripTelegramHtml(chunk), {
+        link_preview_options: { is_disabled: true },
+      });
+    }
+  }
+}
 
 // Replace the bot's command menu (the slash-command list shown in Telegram clients).
 // setMyCommands fully replaces whatever was previously registered for this bot, so

@@ -13,11 +13,10 @@
 // the turn.
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { fmt, b, code } from "@grammyjs/parse-mode";
 import path from "node:path";
 import os from "node:os";
 import { config } from "./config.js";
-import { bot, getActiveSessionId } from "./telegram.js";
+import { bot, getActiveSessionId, sendAgentReply } from "./telegram.js";
 import { shortSid } from "./format.js";
 
 export interface InboundJob {
@@ -34,9 +33,18 @@ interface ClaudeResult {
   stderr: string;
 }
 
-// Telegram caps message text at 4096 chars; leave headroom for the header
-// line + truncation marker so an oversize reply still lands cleanly.
-const BODY_CAP = 3500;
+// Content-shape guidance appended to Claude's default system prompt while a
+// session is bridged to Telegram. Pure shape advice — never tells the model
+// about Telegram's HTML / Markdown syntax (that's our converter's job).
+const TELEGRAM_NUDGE = [
+  "You are responding through a Telegram bridge — your output is rendered on a phone in a chat client.",
+  "Format your replies for that medium:",
+  "- Keep paragraphs short and scannable; favour 2–4 line paragraphs over long blocks of prose.",
+  "- Wrap multi-line code, JSON, command output, file dumps, and any tabular data in fenced code blocks (```).",
+  "- Avoid wide Markdown tables; convert them to short bullet lists or compact prose.",
+  "- Skip long horizontal rules and ASCII art; they waste vertical space on a phone.",
+  "- Use bold / italics / inline code sparingly, only for genuine emphasis.",
+].join("\n");
 
 // Sessions for which the bridge is currently producing a reply (or just did).
 // Stored as deadline timestamps: while Date.now() < deadline, intake should
@@ -94,16 +102,6 @@ function projectLabel(cwd: string): string {
   return cwd === os.homedir() ? "~" : path.basename(cwd);
 }
 
-async function forwardReply(sessionId: string, projLabel: string, text: string): Promise<void> {
-  const body = text.length <= BODY_CAP
-    ? text
-    : text.slice(0, BODY_CAP).trimEnd() + "\n…(truncated)";
-  const msg = fmt`${b}${projLabel}${b} · ${code}${shortSid(sessionId)}${code}\n\n${body}`;
-  await bot.api.sendMessage(config.allowedChatId, msg.text, {
-    entities: msg.entities,
-    link_preview_options: { is_disabled: true },
-  });
-}
 
 async function runJob(job: InboundJob): Promise<void> {
   // Bail if the user disconnected or switched between enqueue and dequeue.
@@ -140,7 +138,7 @@ async function runJob(job: InboundJob): Promise<void> {
     const reply = result.stdout.trim();
     if (reply) {
       try {
-        await forwardReply(job.targetSessionId, projectLabel(job.targetCwd), reply);
+        await sendAgentReply(job.targetSessionId, projectLabel(job.targetCwd), reply);
         console.log(
           `inbound: forwarded sid=${shortSid(job.targetSessionId)} bytes=${reply.length}`,
         );
@@ -192,6 +190,10 @@ async function runClaude(job: InboundJob): Promise<ClaudeResult> {
         allowDangerouslySkipPermissions: true,
         abortController: controller,
         includePartialMessages: false,
+        // Append our Telegram-shape guidance to the default Claude Code system
+        // prompt. Only added on bridge-driven turns — sessions driven directly
+        // from the desktop client are unaffected.
+        systemPrompt: { type: "preset", preset: "claude_code", append: TELEGRAM_NUDGE },
         // Pipe the bundled CLI's stderr into our log surface — without this
         // the SDK silently discards it and any failure shows up as a bare
         // "claude exited -1" with no diagnostic text.
