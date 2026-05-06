@@ -9,13 +9,13 @@ import { Bot, Context, InlineKeyboard } from "grammy";
 import { fmt, b, i, code, FormattedString } from "@grammyjs/parse-mode";
 import path from "node:path";
 import fs from "node:fs/promises";
+import { homedir } from "node:os";
 import { config } from "./config.js";
 import { listRecentSessions, findSessionCwd, getSessionStats } from "./sessions.js";
 import { age, shortSid, truncate, formatTokens } from "./format.js";
 import { loadState, saveState } from "./state.js";
 import { enqueueInbound, cancelActive } from "./inbound.js";
 import { renderTaskBoard } from "./tasksView.js";
-import { listProjectFolders } from "./projects.js";
 import {
   markdownToTelegramBlocks,
   packBlocks,
@@ -48,7 +48,7 @@ async function ack(ctx: Context): Promise<void> {
 const HELP_TEXT =
   "Commands:\n" +
   "/sessions – list recent sessions, tap to connect\n" +
-  "/new – start a fresh session in a chosen folder\n" +
+  "/new – start a fresh session (in $HOME)\n" +
   "/status – current connection\n" +
   "/compact – compact the connected session\n" +
   "/cancel – stop the in-flight turn and drain the queue\n" +
@@ -141,41 +141,15 @@ bot.command("cancel", async (ctx) => {
   await ctx.reply(`🛑 ${parts.join(", ")}.`);
 });
 
-// /new — pick a recent project folder, then your next plain-text message
-// starts a fresh session in that folder. Two-step so the keyboard fits
-// Telegram's UX (free-text with arg parsing would be uglier).
+// /new — your next plain-text message starts a fresh session in $HOME.
+// We always use the home directory as cwd (matching the agent-ui default)
+// rather than asking which folder; ad-hoc sessions don't usually need a
+// project-specific cwd, and removing the picker is one fewer tap.
 bot.command("new", async (ctx) => {
-  const folders = await listProjectFolders(12);
-  if (folders.length === 0) {
-    await ctx.reply("No project folders found in ~/projects/.");
-    return;
-  }
-  const keyboard = new InlineKeyboard();
-  folders.forEach((f, idx) => {
-    keyboard.text(f.label, `newcwd:${f.path}`);
-    if (idx % 2 === 1) keyboard.row();
-  });
-  if (folders.length % 2 === 1) keyboard.row();
-  keyboard.text("✕ Cancel", "newcwd_cancel");
-  await ctx.reply("Pick a folder for the new session:", { reply_markup: keyboard });
-});
-
-bot.callbackQuery("newcwd_cancel", async (ctx) => {
-  pendingNewCwd = null;
-  await ctx.answerCallbackQuery();
-  try { await ctx.editMessageText("Cancelled."); } catch { /* ignore */ }
-});
-
-bot.callbackQuery(/^newcwd:(.+)$/, async (ctx) => {
-  const cwd = ctx.match[1];
+  const cwd = homedir();
   pendingNewCwd = cwd;
-  await ctx.answerCallbackQuery();
   const m = fmt`Send your first message — it'll start a fresh session in ${code}${cwd}${code}.`;
-  try {
-    await ctx.editMessageText(m.text, { entities: m.entities });
-  } catch {
-    await ctx.reply(m.text, { entities: m.entities });
-  }
+  await ctx.reply(m.text, { entities: m.entities });
 });
 
 // /tasks — read-only view of /home/clawd/tasks.json. Compact summary tuned
@@ -428,7 +402,7 @@ export async function sendAgentReply(
 export async function registerCommandMenu(): Promise<void> {
   await bot.api.setMyCommands([
     { command: "sessions",   description: "List recent sessions, tap to connect" },
-    { command: "new",        description: "Start a fresh session in a chosen folder" },
+    { command: "new",        description: "Start a fresh session in $HOME" },
     { command: "status",     description: "Show current connection" },
     { command: "compact",    description: "Compact the connected session" },
     { command: "cancel",     description: "Stop the in-flight turn and drain the queue" },
