@@ -64,8 +64,8 @@ const HELP_TEXT =
   "Plain text → piped into the connected session as a user message.\n" +
   "Photos / documents (PDF, text, markdown, CSV…) → downloaded and shown to " +
   "the session via its Read tool.\n" +
-  "Reply to one of the bot's previous messages → routes that single turn to " +
-  "the session that produced it (no need to /switch).\n" +
+  "Reply to one of the bot's previous messages → switches to the session " +
+  "that produced it, just like /switch but one-tap.\n" +
   "Back-to-back messages queue rather than overlap.";
 
 // Pending /new flow: when the user picks a folder via the /new keyboard, we
@@ -311,33 +311,39 @@ async function performSwitch(ctx: Context, arg: string): Promise<void> {
   await ctx.reply(m.text, { entities: m.entities });
 }
 
-// Reply-to-route override: if the inbound message is a reply to one of the
-// bot's previous agent-reply chunks, route this single turn to the session
-// that produced that chunk — even if it's not the currently-connected one.
-// Returns null when there's no reply, no matching route, or the session's
-// cwd is no longer on disk (caller falls back to the active session).
+// Reply-to-switch: if the inbound message is a reply to one of the bot's
+// previous agent-reply chunks, treat that as an implicit /switch — connect
+// to the session that produced the chunk and acknowledge with the same
+// notice the explicit /switch command sends. Idempotent if we're already
+// on that session, and a no-op if there's no reply / no matching route.
 //
-// This is a single-turn override only — it does NOT change the active
-// connection. Subsequent non-reply messages still route to whichever
-// session is currently connected.
-async function resolveReplyOverride(
-  ctx: Context,
-): Promise<{ sid: string; cwd: string } | null> {
+// After this returns, normal active-session resolution will pick up the
+// (possibly newly-set) active session and the rest of the handler runs
+// against it. Inbound dispatch and outbound delivery both stay consistent
+// because everything keys off `active_session_id`.
+async function maybeSwitchOnReply(ctx: Context): Promise<void> {
   const replyTo = ctx.message?.reply_to_message?.message_id;
-  if (!replyTo) return null;
+  if (!replyTo) return;
   const sid = lookupReplyRoute(state, replyTo);
-  if (!sid) return null;
+  if (!sid) return;
+  if (sid === state.active_session_id) return; // already on it
   const cwd = await findSessionCwd(sid);
   if (!cwd) {
     console.warn(
       `telegram: reply-route hit but cwd missing on disk sid=${shortSid(sid)} msg_id=${replyTo}`,
     );
-    return null;
+    return;
   }
   console.log(
-    `telegram: reply-route override sid=${shortSid(sid)} msg_id=${replyTo}`,
+    `telegram: reply-driven switch sid=${shortSid(sid)} msg_id=${replyTo}`,
   );
-  return { sid, cwd };
+  await setActiveSession(sid, cwd);
+  // An explicit reply-driven switch supersedes any half-armed /switch or /new.
+  pendingSwitch = false;
+  pendingNewCwd = null;
+  const project = path.basename(cwd) || cwd;
+  const m = fmt`Connected to ${code}${shortSid(sid)}${code} · ${b}${project}${b}\n${i}in ${i}${code}${cwd}${code}`;
+  await ctx.reply(m.text, { entities: m.entities });
 }
 
 // Resolve the connected session + cwd, replying with a helpful error and
@@ -374,6 +380,12 @@ bot.on("message:text", async (ctx) => {
   if (!text) return;
   if (text.startsWith("/")) return; // commands handled above
 
+  // Reply-driven switch first: a reply to a tracked agent-reply chunk is
+  // treated as an implicit /switch and supersedes any half-armed /switch
+  // or /new. Sets active_session_id + posts the same "Connected to ..."
+  // notice the /switch command does.
+  await maybeSwitchOnReply(ctx);
+
   // /switch follow-through: bare /switch armed pendingSwitch, this message
   // is the id. Consume and dispatch.
   if (pendingSwitch) {
@@ -398,9 +410,7 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
-  // Reply-to-route takes precedence over the active-session fallback so the
-  // user can talk back to any tracked session without /switch first.
-  const target = (await resolveReplyOverride(ctx)) ?? (await resolveTarget(ctx));
+  const target = await resolveTarget(ctx);
   if (!target) return;
 
   await ack(ctx);
@@ -431,7 +441,8 @@ async function downloadTelegramFile(filePath: string, savePath: string): Promise
 // AND larger work). Until that's fixed upstream, the file-path approach is
 // reliable at any size.
 bot.on("message:photo", async (ctx) => {
-  const target = (await resolveReplyOverride(ctx)) ?? (await resolveTarget(ctx));
+  await maybeSwitchOnReply(ctx);
+  const target = await resolveTarget(ctx);
   if (!target) return;
 
   await ack(ctx);
@@ -475,7 +486,8 @@ bot.on("message:photo", async (ctx) => {
 // a less informative error. The original filename is preserved in both the
 // on-disk path and the prompt so the model has useful naming context.
 bot.on("message:document", async (ctx) => {
-  const target = (await resolveReplyOverride(ctx)) ?? (await resolveTarget(ctx));
+  await maybeSwitchOnReply(ctx);
+  const target = await resolveTarget(ctx);
   if (!target) return;
 
   const doc = ctx.message.document;

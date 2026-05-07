@@ -6,8 +6,8 @@ DM the bot, pick a Claude Code session to follow, and from then on you get the
 end-of-turn messages from that session in Telegram. Anything you send back —
 text, photos, or documents — gets piped into the session as a user message.
 Switch sessions with one tap, or just **reply** to any of the bot's previous
-messages to route a single turn back to the session that produced it. Only
-one session is followed at a time.
+messages to switch to the session that produced it (same effect as `/switch`,
+no typing). Only one session is followed at a time.
 
 ## Architecture
 
@@ -74,10 +74,11 @@ bot-API cap are rejected with a clear error. (Native multimodal input is on
 the SDK roadmap; today the bundled CLI's stream-json parser mishandles long
 single-line JSON inputs, so the file-path path is more reliable.)
 
-Reply to any of the bot's previous reply chunks → that single turn is routed
-to the session that produced it, regardless of which session is currently
-connected. Useful for picking up an older conversation without `/switch`. The
-last 500 chunks the bot has sent are tracked.
+Reply to any of the bot's previous reply chunks → switches to the session
+that produced it (the bot acks with the same "Connected to ..." notice
+`/switch` posts) and your message goes to that session as the first turn
+post-switch. Useful for picking up an older conversation without typing or
+tapping `/switch`. The last 500 chunks the bot has sent are tracked.
 
 ## Setup
 
