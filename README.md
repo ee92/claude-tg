@@ -56,15 +56,25 @@ Two directions, one delivery path:
 
 ## Telegram commands
 
-- `/sessions` — list ten most-recent sessions, tap a button to connect
-- `/switch [id]` — connect to any session by id (or call bare to be prompted)
+- `/resume [id]` — pick a recent session (tap from list) or jump to one by id
 - `/new` — start a fresh session in `$HOME`
 - `/status` — show current connection (model, last-turn context, message count)
 - `/compact` — compact the connected session
 - `/cancel` — stop the in-flight turn and drop everything queued behind it
 - `/tasks` — show the connected session's TodoWrite list
+- `/menu` — list every slash command this session can run, each tappable
 - `/disconnect` — stop following
 - `/help` — command summary
+
+`/sessions` and `/switch` keep working as aliases for `/resume`.
+
+Any other slash command — your installed skills, project-scoped custom
+commands, and most Claude Code built-ins — gets forwarded to the
+connected session. Local-command output (e.g. `/cost`, `/usage`) is sent
+back as one Telegram message; commands that invoke the model deliver
+via the existing end-of-turn path. Interactive built-ins that need a
+real terminal (auth flows, TUI pickers, etc.) are politely refused with
+a hint pointing at the bridge equivalent where one exists.
 
 Plain text → goes to the connected session as a user message.
 Photos and documents (PDF, text, markdown, CSV, source files…) → downloaded,
@@ -76,9 +86,9 @@ single-line JSON inputs, so the file-path path is more reliable.)
 
 Reply to any of the bot's previous reply chunks → switches to the session
 that produced it (the bot acks with the same "Connected to ..." notice
-`/switch` posts) and your message goes to that session as the first turn
+`/resume` posts) and your message goes to that session as the first turn
 post-switch. Useful for picking up an older conversation without typing or
-tapping `/switch`. The last 500 chunks the bot has sent are tracked.
+tapping `/resume`. The last 500 chunks the bot has sent are tracked.
 
 ## Setup
 

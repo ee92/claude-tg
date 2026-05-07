@@ -16,6 +16,8 @@ import { age, shortSid, truncate, formatTokens } from "./format.js";
 import { loadState, saveState, appendReplyRoutes, lookupReplyRoute } from "./state.js";
 import { enqueueInbound, cancelActive } from "./inbound.js";
 import { renderSessionTodos } from "./sessionTodos.js";
+import { isBlocked, blockedReply, parseSlashCommand } from "./slashCommands.js";
+import { fetchAvailableCommands, renderCommandMenu } from "./commandList.js";
 import {
   markdownToTelegramBlocks,
   packBlocks,
@@ -52,20 +54,22 @@ async function ack(ctx: Context): Promise<void> {
 
 const HELP_TEXT =
   "Commands:\n" +
-  "/sessions – list recent sessions, tap to connect\n" +
-  "/switch [id] – connect to any session by id (or call bare to be prompted)\n" +
+  "/resume [id] – pick a recent session, or jump to one by id\n" +
   "/new – start a fresh session (in $HOME)\n" +
   "/status – current connection\n" +
   "/compact – compact the connected session\n" +
   "/cancel – stop the in-flight turn and drain the queue\n" +
   "/tasks – show the connected session's TodoWrite list\n" +
+  "/menu – list every slash command this session can run (tap to send)\n" +
   "/disconnect – stop following\n" +
   "/help – this message\n\n" +
+  "Any other slash command (your skills, /cost, /init, /context, etc.) → " +
+  "forwarded to the connected session; output comes back as a chat message.\n" +
   "Plain text → piped into the connected session as a user message.\n" +
   "Photos / documents (PDF, text, markdown, CSV…) → downloaded and shown to " +
   "the session via its Read tool.\n" +
   "Reply to one of the bot's previous messages → switches to the session " +
-  "that produced it, just like /switch but one-tap.\n" +
+  "that produced it, just like /resume but one-tap.\n" +
   "Back-to-back messages queue rather than overlap.";
 
 // Pending /new flow: when the user picks a folder via the /new keyboard, we
@@ -84,7 +88,7 @@ let pendingSwitch = false;
 bot.command("start", async (ctx) => {
   await ctx.reply(
     "👋 Claudesworth online.\n\n" +
-    "/sessions to pick a session to follow. Once connected, every end-of-turn " +
+    "/resume to pick a session to follow. Once connected, every end-of-turn " +
     "message from that session lands here, and anything you send back is piped " +
     "into the session.\n\n" +
     HELP_TEXT,
@@ -99,7 +103,7 @@ bot.command("status", async (ctx) => {
   const sid = state.active_session_id;
   const cwd = state.active_cwd;
   if (!sid) {
-    await ctx.reply("Not connected to any session.\nUse /sessions to pick one.");
+    await ctx.reply("Not connected to any session.\nUse /resume to pick one.");
     return;
   }
 
@@ -173,7 +177,7 @@ bot.command("new", async (ctx) => {
 bot.command("tasks", async (ctx) => {
   const sid = state.active_session_id;
   if (!sid) {
-    await ctx.reply("Not connected to any session.\nUse /sessions to pick one.");
+    await ctx.reply("Not connected to any session.\nUse /resume to pick one.");
     return;
   }
   try {
@@ -182,6 +186,30 @@ bot.command("tasks", async (ctx) => {
   } catch (e) {
     console.error(`telegram: /tasks failed: ${(e as Error).message}`);
     await ctx.reply(`⚠️ couldn't read session todos: ${(e as Error).message}`);
+  }
+});
+
+// /menu — surface the connected session's full slash-command roster (skills,
+// custom commands, CLI built-ins) as a tappable list. Telegram auto-detects
+// /cmd tokens in bot messages and makes them tappable in DMs, so each line
+// becomes one-tap to send. Filters out the bot's own commands and the
+// blocklist so only commands that'll actually run over the bridge appear.
+//
+// Live-fetched (no cache): an ephemeral SDK session in the connected cwd
+// emits the init message with the full roster, then we abort. Costs about
+// a process startup; trades a small latency for always-current results
+// when skills are added or the cwd changes.
+bot.command("menu", async (ctx) => {
+  const target = await resolveTarget(ctx);
+  if (!target) return;
+  await ack(ctx);
+  try {
+    const commands = await fetchAvailableCommands(target.cwd);
+    const body = renderCommandMenu(commands, target.cwd);
+    await ctx.reply(body, { link_preview_options: { is_disabled: true } });
+  } catch (e) {
+    console.error(`telegram: /menu fetch failed: ${(e as Error).message}`);
+    await ctx.reply(`⚠️ couldn't fetch commands: ${(e as Error).message}`);
   }
 });
 
@@ -200,7 +228,9 @@ bot.command("disconnect", async (ctx) => {
   }
 });
 
-bot.command("sessions", async (ctx) => {
+// Render the "tap to connect" picker. Shared between /resume (the canonical
+// name) and /sessions (legacy alias kept during the deprecation cycle).
+async function renderResumePicker(ctx: Context): Promise<void> {
   const sessions = await listRecentSessions(SESSION_LIST_LIMIT);
   if (sessions.length === 0) {
     await ctx.reply("No sessions found yet.");
@@ -225,6 +255,26 @@ bot.command("sessions", async (ctx) => {
   for (let k = 1; k < parts.length; k++) body = fmt`${body}${parts[k]}`;
 
   await ctx.reply(body.text, { entities: body.entities, reply_markup: keyboard });
+}
+
+// /resume — canonical "pick or jump to a session" command. Bare call shows
+// the recent-sessions picker (formerly /sessions); with an id arg it
+// behaves like the old /switch: prefix-match against the on-disk session
+// roster, ambiguity disambiguated, single match connects.
+bot.command("resume", async (ctx) => {
+  const arg = (ctx.match ?? "").trim();
+  if (!arg) {
+    await renderResumePicker(ctx);
+    return;
+  }
+  await performSwitch(ctx, arg);
+});
+
+// Legacy alias: /sessions still shows the picker, with a one-line nudge
+// toward the new name.
+bot.command("sessions", async (ctx) => {
+  await ctx.reply("→ /resume does this now. /sessions still works during the transition.");
+  await renderResumePicker(ctx);
 });
 
 bot.callbackQuery(/^connect:(.+)$/, async (ctx) => {
@@ -253,17 +303,12 @@ bot.callbackQuery("disconnect", async (ctx) => {
   try { await ctx.editMessageText("Disconnected."); } catch { /* ignore */ }
 });
 
-// /switch [id] — connect to any session by id (full UUID or short prefix,
-// 4+ chars). Walks every project dir on disk so you can resume sessions
-// older than the /sessions top-N. Disambiguates if a prefix matches more
-// than one session. The short id shown in every reply header is what the
-// user will most often paste back here.
-//
-// Two-step variant: bare /switch arms `pendingSwitch`, then the next
-// free-text message is treated as the id. Lets the user tap /switch from
-// the slash-command menu without typing the command first.
+// Legacy alias: /switch still works (with-arg connects, bare arms the
+// two-step "send the id next" flow). Behavior preserved for muscle memory;
+// /resume is the new canonical name and gets surfaced via the slash menu.
 bot.command("switch", async (ctx) => {
   const arg = (ctx.match ?? "").trim();
+  await ctx.reply("→ /resume does this now (and shows a picker bare). /switch still works during the transition.");
   if (!arg) {
     pendingSwitch = true;
     pendingNewCwd = null;
@@ -353,7 +398,7 @@ async function resolveTarget(ctx: Context): Promise<{ sid: string; cwd: string }
   let sid = state.active_session_id;
   let cwd = state.active_cwd;
   if (!sid) {
-    await ctx.reply("Not connected to any session.\nUse /sessions to pick one.");
+    await ctx.reply("Not connected to any session.\nUse /resume to pick one.");
     return null;
   }
   if (!cwd) {
@@ -365,7 +410,7 @@ async function resolveTarget(ctx: Context): Promise<{ sid: string; cwd: string }
     } else {
       await ctx.reply(
         "Couldn't find this session's working directory on disk. " +
-        "Try /sessions and reconnect to refresh."
+        "Try /resume and reconnect to refresh."
       );
       return null;
     }
@@ -374,17 +419,49 @@ async function resolveTarget(ctx: Context): Promise<{ sid: string; cwd: string }
 }
 
 // Free text → enqueue for the connected session, OR consume a pending
-// /switch / /new follow-through.
+// /switch / /new follow-through, OR pass through an unrecognised slash
+// command to the connected session (after blocklist check).
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text.trim();
   if (!text) return;
-  if (text.startsWith("/")) return; // commands handled above
 
   // Reply-driven switch first: a reply to a tracked agent-reply chunk is
   // treated as an implicit /switch and supersedes any half-armed /switch
   // or /new. Sets active_session_id + posts the same "Connected to ..."
-  // notice the /switch command does.
+  // notice the /switch command does. Runs for both text and slash-command
+  // dispatches because the user may want to re-target a slash command at
+  // an older session by replying to one of its messages.
   await maybeSwitchOnReply(ctx);
+
+  // Slash-command catch-all. Anything reaching this handler with a leading
+  // slash didn't match a bot.command() registration, so it's a CLI built-in
+  // or a user-defined command. Reject the blocklist with a friendly notice;
+  // forward everything else verbatim to the connected session, where the
+  // SDK runs the local slash-command handler. Output (system/local_command_
+  // output messages and any assistant turn) flows back through the inbound
+  // worker's normal capture and Stop-hook paths.
+  if (text.startsWith("/")) {
+    const parsed = parseSlashCommand(text);
+    if (!parsed) {
+      await ctx.reply("That doesn't look like a valid slash command. /help shows what's available.");
+      return;
+    }
+    if (isBlocked(parsed.name)) {
+      await ctx.reply(blockedReply(parsed.name));
+      return;
+    }
+    const target = await resolveTarget(ctx);
+    if (!target) return;
+    await ack(ctx);
+    enqueueInbound({
+      text,
+      chatId: ctx.chat.id,
+      userMessageId: ctx.message.message_id,
+      targetSessionId: target.sid,
+      targetCwd: target.cwd,
+    });
+    return;
+  }
 
   // /switch follow-through: bare /switch armed pendingSwitch, this message
   // is the id. Consume and dispatch.
@@ -625,13 +702,13 @@ export async function sendAgentReply(
 // any legacy commands left over from prior incarnations get cleared.
 export async function registerCommandMenu(): Promise<void> {
   await bot.api.setMyCommands([
-    { command: "sessions",   description: "List recent sessions, tap to connect" },
-    { command: "switch",     description: "Connect to any session by id" },
+    { command: "resume",     description: "Pick a recent session, or jump by id" },
     { command: "new",        description: "Start a fresh session in $HOME" },
     { command: "status",     description: "Show current connection" },
     { command: "compact",    description: "Compact the connected session" },
     { command: "cancel",     description: "Stop the in-flight turn and drain the queue" },
     { command: "tasks",      description: "Show the connected session's TodoWrite list" },
+    { command: "menu",       description: "List every slash command this session can run" },
     { command: "disconnect", description: "Stop following the current session" },
     { command: "help",       description: "Show available commands" },
   ]);

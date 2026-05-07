@@ -7,9 +7,10 @@
 // text in-band, so external turns and bridge-driven turns share a single
 // delivery channel. This module only surfaces failures.
 
+import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "./config.js";
-import { bot, getActiveSessionId, setActiveSession } from "./telegram.js";
+import { bot, getActiveSessionId, setActiveSession, sendAgentReply } from "./telegram.js";
 import { shortSid, formatTokens } from "./format.js";
 import { claudeBinaryPath } from "./sdkBinary.js";
 import { createTelegramAttachServer } from "./telegramAttachTool.js";
@@ -204,9 +205,30 @@ async function runClaude(job: InboundJob & { targetSessionId: string }): Promise
       },
     });
 
-    // Drain the iterator — we don't read its text (the Stop hook delivers
-    // that), but we do need the `result` message to detect failures.
+    // Drain the iterator. Two interesting message kinds:
+    //   - `result` — needed to detect failures.
+    //   - `system / local_command_output` — emitted when the prompt was a
+    //     local slash command (/cost, /context, /usage, …). Pure-local
+    //     commands produce no assistant text, so the Stop hook's
+    //     last_assistant_message is empty and intake silently drops it;
+    //     without an explicit forward here, the user never sees the output.
+    //     For commands that DO invoke the agent, both this output and the
+    //     assistant text reach Telegram (this path + Stop hook), in order.
     for await (const msg of q) {
+      if (msg.type === "system" && msg.subtype === "local_command_output") {
+        const content = (msg as { content?: string }).content?.trim();
+        if (content) {
+          try {
+            const project = path.basename(job.targetCwd) || job.targetCwd;
+            await sendAgentReply(job.targetSessionId, project, content);
+          } catch (e) {
+            console.warn(
+              `inbound: local_command_output forward failed sid=${shortSid(job.targetSessionId)}: ${(e as Error).message}`,
+            );
+          }
+        }
+        continue;
+      }
       if (msg.type === "result") {
         const r = msg as { subtype?: string; is_error?: boolean; errors?: string[] };
         if (r.subtype && r.subtype !== "success") {
