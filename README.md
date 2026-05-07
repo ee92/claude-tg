@@ -4,8 +4,10 @@ A small Telegram bridge for [Claude Code](https://claude.com/claude-code).
 
 DM the bot, pick a Claude Code session to follow, and from then on you get the
 end-of-turn messages from that session in Telegram. Anything you send back —
-text or photos — gets piped into the session as a user message. Switch
-sessions with one tap; only one session is followed at a time.
+text, photos, or documents — gets piped into the session as a user message.
+Switch sessions with one tap, or just **reply** to any of the bot's previous
+messages to route a single turn back to the session that produced it. Only
+one session is followed at a time.
 
 ## Architecture
 
@@ -26,9 +28,11 @@ Two directions, one delivery path:
 ```
 
 - **`src/telegram.ts`** — grammY bot. Handles `/sessions`, `/status`,
-  `/disconnect`, free-text, and photo messages. All handlers are gated on a
-  single configured chat id. Owns `sendAgentReply` — the shared Markdown→
-  Telegram-HTML formatter used by intake on every delivery.
+  `/disconnect`, free-text, photo, and document messages. All handlers are
+  gated on a single configured chat id. Owns `sendAgentReply` — the shared
+  Markdown→Telegram-HTML formatter used by intake on every delivery, which
+  also records each sent chunk's message_id in the reply-route map so the
+  user can reply to any chunk to talk back to that session.
 - **`src/inbound.ts`** — FIFO queue + worker. For each Telegram message, calls
   `query({ prompt, options: { resume, cwd, … } })` on the
   `@anthropic-ai/claude-agent-sdk` to drive the agent. It does **not** deliver
@@ -42,7 +46,8 @@ Two directions, one delivery path:
   recent sessions for `/sessions` and to recover a session's canonical `cwd`
   on demand.
 - **`src/state.ts`** — atomic JSON read/write of `state.json` (active session
-  id + cwd).
+  id + cwd, plus a bounded reply-route map of recent outbound message_ids →
+  the session id that produced them).
 - **`hook.sh`** — shell-only Claude Code Stop hook. Pulls the assistant text
   from the `last_assistant_message` field on the event JSON (Anthropic added
   this specifically to avoid the JSONL-flush race), POSTs it to the intake.
@@ -62,11 +67,17 @@ Two directions, one delivery path:
 - `/help` — command summary
 
 Plain text → goes to the connected session as a user message.
-Photos → downloaded, saved to `/tmp/claudesworth-uploads/`, and shown to the
-session as a path the assistant reads with its Read tool. (Native multimodal
-input is on the SDK roadmap; today the bundled CLI's stream-json parser
-mishandles long single-line JSON inputs, so the file-path path is more
-reliable.)
+Photos and documents (PDF, text, markdown, CSV, source files…) → downloaded,
+saved to `/tmp/claudesworth-uploads/`, and shown to the session as a path the
+assistant reads with its Read tool. Documents larger than Telegram's 20 MB
+bot-API cap are rejected with a clear error. (Native multimodal input is on
+the SDK roadmap; today the bundled CLI's stream-json parser mishandles long
+single-line JSON inputs, so the file-path path is more reliable.)
+
+Reply to any of the bot's previous reply chunks → that single turn is routed
+to the session that produced it, regardless of which session is currently
+connected. Useful for picking up an older conversation without `/switch`. The
+last 500 chunks the bot has sent are tracked.
 
 ## Setup
 

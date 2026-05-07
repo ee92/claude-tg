@@ -13,7 +13,7 @@ import { homedir } from "node:os";
 import { config } from "./config.js";
 import { listRecentSessions, findSessionCwd, findSessionsByPrefix, getSessionStats } from "./sessions.js";
 import { age, shortSid, truncate, formatTokens } from "./format.js";
-import { loadState, saveState } from "./state.js";
+import { loadState, saveState, appendReplyRoutes, lookupReplyRoute } from "./state.js";
 import { enqueueInbound, cancelActive } from "./inbound.js";
 import { renderSessionTodos } from "./sessionTodos.js";
 import {
@@ -26,6 +26,11 @@ import {
 
 const SESSION_LIST_LIMIT = 10;
 const UPLOAD_DIR = "/tmp/claudesworth-uploads";
+
+// Telegram's bot API getFile() only serves files up to ~20 MB. Larger
+// uploads need a different transport not wired up here, so we reject them
+// with a clear message rather than letting getFile() throw a generic error.
+const DOCUMENT_MAX_BYTES = 20 * 1024 * 1024;
 
 let state = await loadState();
 
@@ -57,7 +62,10 @@ const HELP_TEXT =
   "/disconnect – stop following\n" +
   "/help – this message\n\n" +
   "Plain text → piped into the connected session as a user message.\n" +
-  "Photos → downloaded and shown to the session via its Read tool.\n" +
+  "Photos / documents (PDF, text, markdown, CSV…) → downloaded and shown to " +
+  "the session via its Read tool.\n" +
+  "Reply to one of the bot's previous messages → routes that single turn to " +
+  "the session that produced it (no need to /switch).\n" +
   "Back-to-back messages queue rather than overlap.";
 
 // Pending /new flow: when the user picks a folder via the /new keyboard, we
@@ -179,7 +187,10 @@ bot.command("tasks", async (ctx) => {
 
 bot.command("disconnect", async (ctx) => {
   const prev = state.active_session_id;
-  state = { active_session_id: null, active_cwd: null };
+  // Preserve reply_routes — they're independent of the active connection,
+  // so disconnecting shouldn't invalidate the user's ability to reply to
+  // older sessions' messages.
+  state = { ...state, active_session_id: null, active_cwd: null };
   await saveState(state);
   if (prev) {
     const m = fmt`Disconnected from ${code}${shortSid(prev)}${code}.`;
@@ -220,7 +231,7 @@ bot.callbackQuery(/^connect:(.+)$/, async (ctx) => {
   const sid = ctx.match[1];
   await ctx.answerCallbackQuery();
   const cwd = await findSessionCwd(sid);
-  state = { active_session_id: sid, active_cwd: cwd };
+  state = { ...state, active_session_id: sid, active_cwd: cwd };
   await saveState(state);
   const head = fmt`Connected to ${code}${shortSid(sid)}${code}.`;
   const tail = "\nEnd-of-turn messages will arrive here. Send text or photos to talk back.";
@@ -237,7 +248,7 @@ bot.callbackQuery(/^connect:(.+)$/, async (ctx) => {
 
 bot.callbackQuery("disconnect", async (ctx) => {
   await ctx.answerCallbackQuery();
-  state = { active_session_id: null, active_cwd: null };
+  state = { ...state, active_session_id: null, active_cwd: null };
   await saveState(state);
   try { await ctx.editMessageText("Disconnected."); } catch { /* ignore */ }
 });
@@ -300,8 +311,38 @@ async function performSwitch(ctx: Context, arg: string): Promise<void> {
   await ctx.reply(m.text, { entities: m.entities });
 }
 
+// Reply-to-route override: if the inbound message is a reply to one of the
+// bot's previous agent-reply chunks, route this single turn to the session
+// that produced that chunk — even if it's not the currently-connected one.
+// Returns null when there's no reply, no matching route, or the session's
+// cwd is no longer on disk (caller falls back to the active session).
+//
+// This is a single-turn override only — it does NOT change the active
+// connection. Subsequent non-reply messages still route to whichever
+// session is currently connected.
+async function resolveReplyOverride(
+  ctx: Context,
+): Promise<{ sid: string; cwd: string } | null> {
+  const replyTo = ctx.message?.reply_to_message?.message_id;
+  if (!replyTo) return null;
+  const sid = lookupReplyRoute(state, replyTo);
+  if (!sid) return null;
+  const cwd = await findSessionCwd(sid);
+  if (!cwd) {
+    console.warn(
+      `telegram: reply-route hit but cwd missing on disk sid=${shortSid(sid)} msg_id=${replyTo}`,
+    );
+    return null;
+  }
+  console.log(
+    `telegram: reply-route override sid=${shortSid(sid)} msg_id=${replyTo}`,
+  );
+  return { sid, cwd };
+}
+
 // Resolve the connected session + cwd, replying with a helpful error and
-// returning null if not connected. Shared by text and photo handlers.
+// returning null if not connected. Shared by text, photo, and document
+// handlers as the fallback when no reply-route override is in play.
 async function resolveTarget(ctx: Context): Promise<{ sid: string; cwd: string } | null> {
   let sid = state.active_session_id;
   let cwd = state.active_cwd;
@@ -357,7 +398,9 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
-  const target = await resolveTarget(ctx);
+  // Reply-to-route takes precedence over the active-session fallback so the
+  // user can talk back to any tracked session without /switch first.
+  const target = (await resolveReplyOverride(ctx)) ?? (await resolveTarget(ctx));
   if (!target) return;
 
   await ack(ctx);
@@ -388,7 +431,7 @@ async function downloadTelegramFile(filePath: string, savePath: string): Promise
 // AND larger work). Until that's fixed upstream, the file-path approach is
 // reliable at any size.
 bot.on("message:photo", async (ctx) => {
-  const target = await resolveTarget(ctx);
+  const target = (await resolveReplyOverride(ctx)) ?? (await resolveTarget(ctx));
   if (!target) return;
 
   await ack(ctx);
@@ -425,6 +468,73 @@ bot.on("message:photo", async (ctx) => {
   });
 });
 
+// Documents (PDF, text, markdown, CSV, JSON, source files, etc.) → same shape
+// as the photo path: download to /tmp, hand Claude a Read-tool prompt with
+// the local path. Telegram's getFile() bot endpoint caps at ~20 MB, so we
+// reject larger uploads up front rather than letting the download fail with
+// a less informative error. The original filename is preserved in both the
+// on-disk path and the prompt so the model has useful naming context.
+bot.on("message:document", async (ctx) => {
+  const target = (await resolveReplyOverride(ctx)) ?? (await resolveTarget(ctx));
+  if (!target) return;
+
+  const doc = ctx.message.document;
+  if (typeof doc.file_size === "number" && doc.file_size > DOCUMENT_MAX_BYTES) {
+    const mb = (doc.file_size / 1024 / 1024).toFixed(1);
+    await ctx.reply(
+      `⚠️ document is ${mb} MB, over the 20 MB Telegram bot limit. ` +
+      "Try splitting it or sharing a smaller excerpt.",
+    );
+    return;
+  }
+
+  await ack(ctx);
+
+  let localPath: string;
+  let displayName: string;
+  try {
+    await fs.mkdir(UPLOAD_DIR, { recursive: true });
+    const file = await ctx.getFile();
+    if (!file.file_path) throw new Error("no file_path in Telegram response");
+
+    // Prefer the original Telegram filename for both the on-disk path and
+    // the model-facing prompt — gives Claude a concrete name to reference.
+    // Fall back to file_path's basename if the document was sent without a
+    // filename (rare but possible). Sanitize to a conservative whitelist so
+    // odd characters never affect the path we hand the SDK.
+    const rawName = doc.file_name ?? path.basename(file.file_path);
+    displayName = rawName;
+    const safeName = rawName.replace(/[^a-zA-Z0-9._-]/g, "_") || "document";
+    localPath = path.join(
+      UPLOAD_DIR,
+      `${ctx.chat.id}-${ctx.message.message_id}-${safeName}`,
+    );
+    await downloadTelegramFile(file.file_path, localPath);
+    console.log(
+      `telegram: document saved sid=${shortSid(target.sid)} path=${localPath} ` +
+      `mime=${doc.mime_type ?? "?"} bytes=${doc.file_size ?? "?"}`,
+    );
+  } catch (e) {
+    console.error(`telegram: document download failed: ${(e as Error).message}`);
+    await ctx.reply("⚠️ couldn't fetch that document from Telegram.");
+    return;
+  }
+
+  const caption = (ctx.message.caption ?? "").trim();
+  const head =
+    `The user attached a document "${displayName}" at ${localPath}. ` +
+    "Read it with the Read tool, then respond.";
+  const promptText = caption ? `${head}\n\nCaption: ${caption}` : head;
+
+  enqueueInbound({
+    text: promptText,
+    chatId: ctx.chat.id,
+    userMessageId: ctx.message.message_id,
+    targetSessionId: target.sid,
+    targetCwd: target.cwd,
+  });
+});
+
 // Read accessors for other modules.
 export function getActiveSessionId(): string | null { return state.active_session_id; }
 export function getActiveCwd(): string | null { return state.active_cwd; }
@@ -432,7 +542,7 @@ export function getActiveCwd(): string | null { return state.active_cwd; }
 // Mutator used by the new-session path in inbound.ts. Sets and persists the
 // active connection so the Stop hook's POST is recognised as the active sid.
 export async function setActiveSession(sid: string, cwd: string): Promise<void> {
-  state = { active_session_id: sid, active_cwd: cwd };
+  state = { ...state, active_session_id: sid, active_cwd: cwd };
   await saveState(state);
   console.log(`telegram: active session set sid=${shortSid(sid)} cwd=${cwd}`);
 }
@@ -442,6 +552,11 @@ export async function setActiveSession(sid: string, cwd: string): Promise<void> 
 // session-identifying header to the first chunk, and falls back to plain
 // text if Telegram rejects the formatted send. Called from intake on every
 // Stop-hook delivery.
+//
+// Side effect: each sent chunk's Telegram message_id is recorded in the
+// reply-route map so a later "reply to" of any chunk routes the next turn
+// back to this session. Persisted once per call (after all chunks land) to
+// minimize state.json churn.
 export async function sendAgentReply(
   sessionId: string,
   projectLabel: string,
@@ -454,12 +569,14 @@ export async function sendAgentReply(
   const contentBlocks = blocks.length > 0 ? blocks : [escHtml(text)];
   const chunks = packBlocks([header, ...contentBlocks], TELEGRAM_SAFE_CAP);
 
+  const sentIds: number[] = [];
   for (const chunk of chunks) {
     try {
-      await bot.api.sendMessage(config.allowedChatId, chunk, {
+      const sent = await bot.api.sendMessage(config.allowedChatId, chunk, {
         parse_mode: "HTML",
         link_preview_options: { is_disabled: true },
       });
+      sentIds.push(sent.message_id);
     } catch (e) {
       // Telegram rejected the formatted send (unsupported tag, malformed
       // entity). Retry with tags stripped so the content still reaches
@@ -467,9 +584,26 @@ export async function sendAgentReply(
       console.warn(
         `telegram: HTML send rejected sid=${shortSid(sessionId)}: ${(e as Error).message}; retrying plain`,
       );
-      await bot.api.sendMessage(config.allowedChatId, stripTelegramHtml(chunk), {
-        link_preview_options: { is_disabled: true },
-      });
+      const sent = await bot.api.sendMessage(
+        config.allowedChatId,
+        stripTelegramHtml(chunk),
+        { link_preview_options: { is_disabled: true } },
+      );
+      sentIds.push(sent.message_id);
+    }
+  }
+
+  if (sentIds.length > 0) {
+    state = appendReplyRoutes(state, sentIds, sessionId);
+    try {
+      await saveState(state);
+    } catch (e) {
+      // A persistence failure here just means future replies-to-this-turn
+      // fall back to the active session — annoying but not fatal. Log and
+      // move on rather than masking the successful Telegram delivery.
+      console.warn(
+        `telegram: reply-route persist failed sid=${shortSid(sessionId)}: ${(e as Error).message}`,
+      );
     }
   }
 }
