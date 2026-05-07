@@ -59,11 +59,11 @@ export const LEGACY_ALIASES: ReadonlyMap<string, string> = new Map([
 
 // Commands the bot handles itself — distinct (bridge-only), override
 // (Telegram-native replacement), and wrap (chrome around the CLI version).
-// /menu uses this set to drop these from the auto-discovered list so it
-// doesn't surface duplicate or no-op entries. Stored without leading slash.
+// /commands uses this set to drop these from the auto-discovered roster
+// so it doesn't surface duplicate or no-op entries.
 export const BOT_HANDLED_COMMANDS: ReadonlySet<string> = new Set([
   // Distinct
-  "new", "cancel", "disconnect", "menu",
+  "new", "cancel", "disconnect", "commands",
   // Override
   "resume",
   // Legacy aliases (still resolve during deprecation)
@@ -94,11 +94,9 @@ const blockedHints: Record<string, string> = {
   "deploy": "The deploy CLI runs on the host — open a terminal session.",
 };
 
-// Normalise raw user input to a bare command name. Strips leading slash,
-// trailing args, surrounding whitespace, lowercases. `/Cost   foo` → `cost`.
-// Name pattern allows hyphens and colons (plugin-namespaced commands like
-// `/context-doctor:ctx-doctor`) plus underscores (Telegram-tappable display
-// form for those, which the catch-all translates back to canonical).
+// Name accepts word chars, hyphens, and colons — covers plugin-namespaced
+// commands like `/context-doctor:ctx-doctor` and the underscore display form
+// Telegram users can tap (catch-all translates back to canonical).
 export function parseSlashCommand(text: string): { name: string; rest: string } | null {
   const m = text.match(/^\/([a-zA-Z][\w:-]*)(?:\s+([\s\S]*))?$/);
   if (!m) return null;

@@ -22,6 +22,7 @@ import {
   renderCommandList,
   canonicalizeName,
   commandArgHint,
+  clearCommandCache,
 } from "./commandList.js";
 import {
   markdownToTelegramBlocks,
@@ -90,14 +91,11 @@ let pendingNewCwd: string | null = null;
 // pendingNewCwd — setting one clears the other.
 let pendingSwitch = false;
 
-// Pending /commands args flow: when the user taps a bare slash command that
-// the SDK has a non-empty argumentHint for (`/loop`, `/batch`, `/debug`,
-// `/compact`), we stash the canonical name here and prompt for args. The
-// next free-text message becomes the args, and we forward `/{name} {args}`
-// to the connected session. Cleared on /cancel, on a new explicit slash
-// command, or after the args message is consumed. Mutually exclusive with
-// pendingNewCwd / pendingSwitch.
-let pendingArgs: { canonical: string; hint: string } | null = null;
+// Pending args flow for /commands: tap of a hint-bearing command stashes its
+// canonical name here and prompts the user for args. The next text message
+// becomes the args and we forward `/{name} {args}`. Cleared on /cancel, any
+// other bot command, an inbound photo/document, or after consumption.
+let pendingArgs: { canonical: string } | null = null;
 
 function clearAllPending(): void {
   pendingNewCwd = null;
@@ -165,9 +163,8 @@ bot.command("compact", async (ctx) => {
   });
 });
 
-// Stop the in-flight turn (if any) and drop everything still queued. Also
-// clears any half-armed bridge state (/new, /switch, /commands args prompt)
-// so /cancel works as a universal abort.
+// Universal abort: stops the in-flight turn, drains the queue, and clears
+// any half-armed bridge state.
 bot.command("cancel", async (ctx) => {
   const hadPending = pendingArgs !== null || pendingSwitch || pendingNewCwd !== null;
   clearAllPending();
@@ -212,18 +209,8 @@ bot.command("tasks", async (ctx) => {
   }
 });
 
-// /commands — surface the connected session's slash-command roster as a
-// tappable, alphabetical list. Filters out blocked + bot-handled commands
-// AND pure expertise-style skills (skills with no declared argument-hint),
-// since those are agent-internal — what's left is built-ins, traditional
-// commands, plugin commands, and skills whose authors signalled direct
-// invocation by declaring a hint.
-//
-// Display names substitute `_` for hyphens and colons so Telegram's auto-
-// linker can make each line tappable; the catch-all reverses the mapping
-// before forwarding. Live-fetched per call via supportedCommands() (no
-// cache) — costs about a CLI process startup, ~1s, but always reflects
-// the current cwd's plugins / project skills / etc.
+// Live-fetched per call (no cache) so plugin / project-skill changes show
+// up immediately. ~1s per invocation — CLI process startup dominates.
 bot.command("commands", async (ctx) => {
   clearAllPending();
   const target = await resolveTarget(ctx);
@@ -308,9 +295,14 @@ bot.command("sessions", async (ctx) => {
 bot.callbackQuery(/^connect:(.+)$/, async (ctx) => {
   const sid = ctx.match[1];
   await ctx.answerCallbackQuery();
+  clearAllPending();
   const cwd = await findSessionCwd(sid);
-  state = { ...state, active_session_id: sid, active_cwd: cwd };
-  await saveState(state);
+  if (cwd) {
+    await setActiveSession(sid, cwd);
+  } else {
+    state = { ...state, active_session_id: sid, active_cwd: null };
+    await saveState(state);
+  }
   const head = fmt`Connected to ${code}${shortSid(sid)}${code}.`;
   const tail = "\nEnd-of-turn messages will arrive here. Send text or photos to talk back.";
   const msg = cwd
@@ -319,7 +311,6 @@ bot.callbackQuery(/^connect:(.+)$/, async (ctx) => {
   try {
     await ctx.editMessageText(msg.text, { entities: msg.entities });
   } catch {
-    // message too old to edit, etc — fall back
     await ctx.reply(msg.text, { entities: msg.entities });
   }
 });
@@ -462,11 +453,9 @@ bot.on("message:text", async (ctx) => {
   // an older session by replying to one of its messages.
   await maybeSwitchOnReply(ctx);
 
-  // pendingArgs takes priority over everything else: the user tapped a
-  // hint-bearing command, the bot asked for args, this message is the args.
-  // We accept slash-leading text too because hints like /loop's "[interval]
-  // <prompt>" naturally include a slash. /cancel is the escape hatch and
-  // never reaches here (bot.command("cancel") clears pendingArgs first).
+  // pendingArgs wins over the slash-command branch — hints like /loop's
+  // "[interval] <prompt>" naturally start with a slash, so we can't gate on
+  // text.startsWith("/"). /cancel is the explicit escape hatch.
   if (pendingArgs) {
     const cmd = pendingArgs.canonical;
     pendingArgs = null;
@@ -483,16 +472,9 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
-  // Slash-command catch-all. Anything reaching this handler with a leading
-  // slash didn't match a bot.command() registration, so it's a CLI built-in,
-  // user-defined command, or skill. Steps:
-  //   1. Parse + canonicalize underscored display form back to its hyphen/
-  //      colon canonical (Telegram tappability constraint).
-  //   2. Reject the blocklist with a friendly notice.
-  //   3. If the user tapped bare AND the SDK has an argument-hint for this
-  //      command, arm the pendingArgs follow-up flow and prompt for args.
-  //   4. Else forward verbatim (rewriting the slash to canonical if we
-  //      translated it). Output flows back via the inbound worker.
+  // Slash-command catch-all: parse, canonicalize the underscored display
+  // form, reject blocklisted, arm pendingArgs if a hint exists for a bare
+  // tap, otherwise forward to the connected session.
   if (text.startsWith("/")) {
     const parsed = parseSlashCommand(text);
     if (!parsed) {
@@ -507,7 +489,7 @@ bot.on("message:text", async (ctx) => {
     if (parsed.rest === "") {
       const hint = commandArgHint(canonical);
       if (hint) {
-        pendingArgs = { canonical, hint };
+        pendingArgs = { canonical };
         pendingNewCwd = null;
         pendingSwitch = false;
         await ctx.reply(`What for /${canonical}?  ${hint}`);
@@ -586,6 +568,9 @@ async function downloadTelegramFile(filePath: string, savePath: string): Promise
 // reliable at any size.
 bot.on("message:photo", async (ctx) => {
   await maybeSwitchOnReply(ctx);
+  // A non-text inbound aborts a half-armed args prompt — the photo isn't
+  // plausibly the args the user was being asked for.
+  pendingArgs = null;
   const target = await resolveTarget(ctx);
   if (!target) return;
 
@@ -631,6 +616,8 @@ bot.on("message:photo", async (ctx) => {
 // on-disk path and the prompt so the model has useful naming context.
 bot.on("message:document", async (ctx) => {
   await maybeSwitchOnReply(ctx);
+  // See photo handler: a non-text inbound aborts a half-armed args prompt.
+  pendingArgs = null;
   const target = await resolveTarget(ctx);
   if (!target) return;
 
@@ -697,9 +684,12 @@ export function getActiveCwd(): string | null { return state.active_cwd; }
 
 // Mutator used by the new-session path in inbound.ts. Sets and persists the
 // active connection so the Stop hook's POST is recognised as the active sid.
+// Also drops the /commands cache: its display→canonical map is per-cwd, so
+// stale entries from the previous session would mistranslate slash taps.
 export async function setActiveSession(sid: string, cwd: string): Promise<void> {
   state = { ...state, active_session_id: sid, active_cwd: cwd };
   await saveState(state);
+  clearCommandCache();
   console.log(`telegram: active session set sid=${shortSid(sid)} cwd=${cwd}`);
 }
 
