@@ -52,7 +52,12 @@ Two directions, one delivery path:
 ## Telegram commands
 
 - `/sessions` — list ten most-recent sessions, tap a button to connect
-- `/status` — show current connection
+- `/switch [id]` — connect to any session by id (or call bare to be prompted)
+- `/new` — start a fresh session in `$HOME`
+- `/status` — show current connection (model, last-turn context, message count)
+- `/compact` — compact the connected session
+- `/cancel` — stop the in-flight turn and drop everything queued behind it
+- `/tasks` — show the connected session's TodoWrite list
 - `/disconnect` — stop following
 - `/help` — command summary
 
@@ -142,3 +147,7 @@ tool, not a multi-tenant service.
   blocks; works, but every photo turn pays one extra tool call.
 - The bundled Claude Code CLI is pinned by the agent SDK version; upgrading
   the SDK upgrades the Claude Code runtime in lockstep.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).

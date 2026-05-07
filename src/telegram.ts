@@ -15,7 +15,7 @@ import { listRecentSessions, findSessionCwd, findSessionsByPrefix, getSessionSta
 import { age, shortSid, truncate, formatTokens } from "./format.js";
 import { loadState, saveState } from "./state.js";
 import { enqueueInbound, cancelActive } from "./inbound.js";
-import { renderTaskBoard } from "./tasksView.js";
+import { renderSessionTodos } from "./sessionTodos.js";
 import {
   markdownToTelegramBlocks,
   packBlocks,
@@ -53,7 +53,7 @@ const HELP_TEXT =
   "/status – current connection\n" +
   "/compact – compact the connected session\n" +
   "/cancel – stop the in-flight turn and drain the queue\n" +
-  "/tasks – read-only view of the task board\n" +
+  "/tasks – show the connected session's TodoWrite list\n" +
   "/disconnect – stop following\n" +
   "/help – this message\n\n" +
   "Plain text → piped into the connected session as a user message.\n" +
@@ -160,16 +160,20 @@ bot.command("new", async (ctx) => {
   await ctx.reply(m.text, { entities: m.entities });
 });
 
-// /tasks — read-only view of /home/clawd/tasks.json. Compact summary tuned
-// for phone reading: shows everything in active/plan/blocked/review, plus a
-// short top-of-todo preview and a count for the rest.
+// /tasks — show the connected session's in-conversation TodoWrite list,
+// extracted from the latest TodoWrite tool_use in its transcript JSONL.
 bot.command("tasks", async (ctx) => {
+  const sid = state.active_session_id;
+  if (!sid) {
+    await ctx.reply("Not connected to any session.\nUse /sessions to pick one.");
+    return;
+  }
   try {
-    const text = await renderTaskBoard();
+    const text = await renderSessionTodos(sid);
     await ctx.reply(text, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
   } catch (e) {
     console.error(`telegram: /tasks failed: ${(e as Error).message}`);
-    await ctx.reply(`⚠️ couldn't read task board: ${(e as Error).message}`);
+    await ctx.reply(`⚠️ couldn't read session todos: ${(e as Error).message}`);
   }
 });
 
@@ -481,7 +485,7 @@ export async function registerCommandMenu(): Promise<void> {
     { command: "status",     description: "Show current connection" },
     { command: "compact",    description: "Compact the connected session" },
     { command: "cancel",     description: "Stop the in-flight turn and drain the queue" },
-    { command: "tasks",      description: "Read-only view of the task board" },
+    { command: "tasks",      description: "Show the connected session's TodoWrite list" },
     { command: "disconnect", description: "Stop following the current session" },
     { command: "help",       description: "Show available commands" },
   ]);
