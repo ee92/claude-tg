@@ -96,8 +96,11 @@ const blockedHints: Record<string, string> = {
 
 // Normalise raw user input to a bare command name. Strips leading slash,
 // trailing args, surrounding whitespace, lowercases. `/Cost   foo` → `cost`.
+// Name pattern allows hyphens and colons (plugin-namespaced commands like
+// `/context-doctor:ctx-doctor`) plus underscores (Telegram-tappable display
+// form for those, which the catch-all translates back to canonical).
 export function parseSlashCommand(text: string): { name: string; rest: string } | null {
-  const m = text.match(/^\/([a-zA-Z][\w-]*)(?:\s+([\s\S]*))?$/);
+  const m = text.match(/^\/([a-zA-Z][\w:-]*)(?:\s+([\s\S]*))?$/);
   if (!m) return null;
   return { name: m[1].toLowerCase(), rest: (m[2] ?? "").trim() };
 }

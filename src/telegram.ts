@@ -17,7 +17,12 @@ import { loadState, saveState, appendReplyRoutes, lookupReplyRoute } from "./sta
 import { enqueueInbound, cancelActive } from "./inbound.js";
 import { renderSessionTodos } from "./sessionTodos.js";
 import { isBlocked, blockedReply, parseSlashCommand } from "./slashCommands.js";
-import { fetchAvailableCommands, renderCommandMenu } from "./commandList.js";
+import {
+  fetchCommandList,
+  renderCommandList,
+  canonicalizeName,
+  commandArgHint,
+} from "./commandList.js";
 import {
   markdownToTelegramBlocks,
   packBlocks,
@@ -60,7 +65,7 @@ const HELP_TEXT =
   "/compact – compact the connected session\n" +
   "/cancel – stop the in-flight turn and drain the queue\n" +
   "/tasks – show the connected session's TodoWrite list\n" +
-  "/menu – list every slash command this session can run (tap to send)\n" +
+  "/commands – list every slash command this session can run (tap to send)\n" +
   "/disconnect – stop following\n" +
   "/help – this message\n\n" +
   "Any other slash command (your skills, /cost, /init, /context, etc.) → " +
@@ -84,6 +89,21 @@ let pendingNewCwd: string | null = null;
 // treated as the session id to switch to. Mutually exclusive with
 // pendingNewCwd — setting one clears the other.
 let pendingSwitch = false;
+
+// Pending /commands args flow: when the user taps a bare slash command that
+// the SDK has a non-empty argumentHint for (`/loop`, `/batch`, `/debug`,
+// `/compact`), we stash the canonical name here and prompt for args. The
+// next free-text message becomes the args, and we forward `/{name} {args}`
+// to the connected session. Cleared on /cancel, on a new explicit slash
+// command, or after the args message is consumed. Mutually exclusive with
+// pendingNewCwd / pendingSwitch.
+let pendingArgs: { canonical: string; hint: string } | null = null;
+
+function clearAllPending(): void {
+  pendingNewCwd = null;
+  pendingSwitch = false;
+  pendingArgs = null;
+}
 
 bot.command("start", async (ctx) => {
   await ctx.reply(
@@ -145,18 +165,21 @@ bot.command("compact", async (ctx) => {
   });
 });
 
-// Stop the in-flight turn (if any) and drop everything still queued. The
-// queue is single-flight, so this is enough to interrupt Claude. Reports
-// what was cancelled.
+// Stop the in-flight turn (if any) and drop everything still queued. Also
+// clears any half-armed bridge state (/new, /switch, /commands args prompt)
+// so /cancel works as a universal abort.
 bot.command("cancel", async (ctx) => {
+  const hadPending = pendingArgs !== null || pendingSwitch || pendingNewCwd !== null;
+  clearAllPending();
   const { cancelledInFlight, queueDrained } = cancelActive();
-  if (!cancelledInFlight && queueDrained === 0) {
+  if (!cancelledInFlight && queueDrained === 0 && !hadPending) {
     await ctx.reply("Nothing in flight to cancel.");
     return;
   }
   const parts: string[] = [];
   if (cancelledInFlight) parts.push("cancelled in-flight turn");
   if (queueDrained > 0) parts.push(`dropped ${queueDrained} queued`);
+  if (hadPending) parts.push("cleared pending input");
   await ctx.reply(`🛑 ${parts.join(", ")}.`);
 });
 
@@ -166,8 +189,8 @@ bot.command("cancel", async (ctx) => {
 // project-specific cwd, and removing the picker is one fewer tap.
 bot.command("new", async (ctx) => {
   const cwd = homedir();
+  clearAllPending();
   pendingNewCwd = cwd;
-  pendingSwitch = false;
   const m = fmt`Send your first message — it'll start a fresh session in ${code}${cwd}${code}.`;
   await ctx.reply(m.text, { entities: m.entities });
 });
@@ -189,26 +212,29 @@ bot.command("tasks", async (ctx) => {
   }
 });
 
-// /menu — surface the connected session's full slash-command roster (skills,
-// custom commands, CLI built-ins) as a tappable list. Telegram auto-detects
-// /cmd tokens in bot messages and makes them tappable in DMs, so each line
-// becomes one-tap to send. Filters out the bot's own commands and the
-// blocklist so only commands that'll actually run over the bridge appear.
+// /commands — surface the connected session's slash-command roster as a
+// tappable, alphabetical list. Filters out blocked + bot-handled commands
+// AND pure expertise-style skills (skills with no declared argument-hint),
+// since those are agent-internal — what's left is built-ins, traditional
+// commands, plugin commands, and skills whose authors signalled direct
+// invocation by declaring a hint.
 //
-// Live-fetched (no cache): an ephemeral SDK session in the connected cwd
-// emits the init message with the full roster, then we abort. Costs about
-// a process startup; trades a small latency for always-current results
-// when skills are added or the cwd changes.
-bot.command("menu", async (ctx) => {
+// Display names substitute `_` for hyphens and colons so Telegram's auto-
+// linker can make each line tappable; the catch-all reverses the mapping
+// before forwarding. Live-fetched per call via supportedCommands() (no
+// cache) — costs about a CLI process startup, ~1s, but always reflects
+// the current cwd's plugins / project skills / etc.
+bot.command("commands", async (ctx) => {
+  clearAllPending();
   const target = await resolveTarget(ctx);
   if (!target) return;
   await ack(ctx);
   try {
-    const commands = await fetchAvailableCommands(target.cwd);
-    const body = renderCommandMenu(commands, target.cwd);
+    const list = await fetchCommandList(target.cwd);
+    const body = renderCommandList(list, target.cwd);
     await ctx.reply(body, { link_preview_options: { is_disabled: true } });
   } catch (e) {
-    console.error(`telegram: /menu fetch failed: ${(e as Error).message}`);
+    console.error(`telegram: /commands fetch failed: ${(e as Error).message}`);
     await ctx.reply(`⚠️ couldn't fetch commands: ${(e as Error).message}`);
   }
 });
@@ -262,6 +288,7 @@ async function renderResumePicker(ctx: Context): Promise<void> {
 // behaves like the old /switch: prefix-match against the on-disk session
 // roster, ambiguity disambiguated, single match connects.
 bot.command("resume", async (ctx) => {
+  clearAllPending();
   const arg = (ctx.match ?? "").trim();
   if (!arg) {
     await renderResumePicker(ctx);
@@ -273,6 +300,7 @@ bot.command("resume", async (ctx) => {
 // Legacy alias: /sessions still shows the picker, with a one-line nudge
 // toward the new name.
 bot.command("sessions", async (ctx) => {
+  clearAllPending();
   await ctx.reply("→ /resume does this now. /sessions still works during the transition.");
   await renderResumePicker(ctx);
 });
@@ -307,11 +335,11 @@ bot.callbackQuery("disconnect", async (ctx) => {
 // two-step "send the id next" flow). Behavior preserved for muscle memory;
 // /resume is the new canonical name and gets surfaced via the slash menu.
 bot.command("switch", async (ctx) => {
+  clearAllPending();
   const arg = (ctx.match ?? "").trim();
   await ctx.reply("→ /resume does this now (and shows a picker bare). /switch still works during the transition.");
   if (!arg) {
     pendingSwitch = true;
-    pendingNewCwd = null;
     await ctx.reply("Send the session id (8-char short form or full UUID).");
     return;
   }
@@ -419,8 +447,9 @@ async function resolveTarget(ctx: Context): Promise<{ sid: string; cwd: string }
 }
 
 // Free text → enqueue for the connected session, OR consume a pending
-// /switch / /new follow-through, OR pass through an unrecognised slash
-// command to the connected session (after blocklist check).
+// /switch / /new / /commands-args follow-through, OR pass through an
+// unrecognised slash command to the connected session (after blocklist
+// check + display-form canonicalization).
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text.trim();
   if (!text) return;
@@ -433,28 +462,66 @@ bot.on("message:text", async (ctx) => {
   // an older session by replying to one of its messages.
   await maybeSwitchOnReply(ctx);
 
+  // pendingArgs takes priority over everything else: the user tapped a
+  // hint-bearing command, the bot asked for args, this message is the args.
+  // We accept slash-leading text too because hints like /loop's "[interval]
+  // <prompt>" naturally include a slash. /cancel is the escape hatch and
+  // never reaches here (bot.command("cancel") clears pendingArgs first).
+  if (pendingArgs) {
+    const cmd = pendingArgs.canonical;
+    pendingArgs = null;
+    const target = await resolveTarget(ctx);
+    if (!target) return;
+    await ack(ctx);
+    enqueueInbound({
+      text: `/${cmd} ${text}`,
+      chatId: ctx.chat.id,
+      userMessageId: ctx.message.message_id,
+      targetSessionId: target.sid,
+      targetCwd: target.cwd,
+    });
+    return;
+  }
+
   // Slash-command catch-all. Anything reaching this handler with a leading
-  // slash didn't match a bot.command() registration, so it's a CLI built-in
-  // or a user-defined command. Reject the blocklist with a friendly notice;
-  // forward everything else verbatim to the connected session, where the
-  // SDK runs the local slash-command handler. Output (system/local_command_
-  // output messages and any assistant turn) flows back through the inbound
-  // worker's normal capture and Stop-hook paths.
+  // slash didn't match a bot.command() registration, so it's a CLI built-in,
+  // user-defined command, or skill. Steps:
+  //   1. Parse + canonicalize underscored display form back to its hyphen/
+  //      colon canonical (Telegram tappability constraint).
+  //   2. Reject the blocklist with a friendly notice.
+  //   3. If the user tapped bare AND the SDK has an argument-hint for this
+  //      command, arm the pendingArgs follow-up flow and prompt for args.
+  //   4. Else forward verbatim (rewriting the slash to canonical if we
+  //      translated it). Output flows back via the inbound worker.
   if (text.startsWith("/")) {
     const parsed = parseSlashCommand(text);
     if (!parsed) {
       await ctx.reply("That doesn't look like a valid slash command. /help shows what's available.");
       return;
     }
-    if (isBlocked(parsed.name)) {
-      await ctx.reply(blockedReply(parsed.name));
+    const canonical = canonicalizeName(parsed.name) ?? parsed.name;
+    if (isBlocked(canonical)) {
+      await ctx.reply(blockedReply(canonical));
       return;
+    }
+    if (parsed.rest === "") {
+      const hint = commandArgHint(canonical);
+      if (hint) {
+        pendingArgs = { canonical, hint };
+        pendingNewCwd = null;
+        pendingSwitch = false;
+        await ctx.reply(`What for /${canonical}?  ${hint}`);
+        return;
+      }
     }
     const target = await resolveTarget(ctx);
     if (!target) return;
     await ack(ctx);
+    const forwardText = canonical !== parsed.name
+      ? (parsed.rest ? `/${canonical} ${parsed.rest}` : `/${canonical}`)
+      : text;
     enqueueInbound({
-      text,
+      text: forwardText,
       chatId: ctx.chat.id,
       userMessageId: ctx.message.message_id,
       targetSessionId: target.sid,
@@ -708,7 +775,7 @@ export async function registerCommandMenu(): Promise<void> {
     { command: "compact",    description: "Compact the connected session" },
     { command: "cancel",     description: "Stop the in-flight turn and drain the queue" },
     { command: "tasks",      description: "Show the connected session's TodoWrite list" },
-    { command: "menu",       description: "List every slash command this session can run" },
+    { command: "commands",   description: "List every slash command this session can run" },
     { command: "disconnect", description: "Stop following the current session" },
     { command: "help",       description: "Show available commands" },
   ]);
