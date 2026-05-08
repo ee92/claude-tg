@@ -55,7 +55,7 @@ import {
 } from "./telegramHtml.js";
 
 const SESSION_LIST_LIMIT = 10;
-const UPLOAD_DIR = "/tmp/claudesworth-uploads";
+const UPLOAD_DIR = "/tmp/claude-code-tg-uploads";
 
 // Telegram's bot API getFile() only serves files up to ~20 MB. Larger
 // uploads need a different transport not wired up here, so we reject them
@@ -194,7 +194,7 @@ function clearAllPending(): void {
 
 bot.command("start", async (ctx) => {
   await ctx.reply(
-    "👋 Claudesworth online.\n\n" +
+    "👋 Bridge online.\n\n" +
     "/resume to pick a session to follow. Once connected, every end-of-turn " +
     "message from that session lands here, and anything you send back is piped " +
     "into the session.\n\n" +

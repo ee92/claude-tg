@@ -6,7 +6,7 @@ import { shortSid } from "./format.js";
 import { config } from "./config.js";
 
 async function main(): Promise<void> {
-  console.log("claudesworth starting…");
+  console.log("claude-code-tg starting…");
 
   const intake = startIntake();
 
@@ -40,7 +40,7 @@ async function main(): Promise<void> {
     onStart: () => {
       const sid = getActiveSessionId();
       console.log(
-        `claudesworth ready — chat_id=${config.allowedChatId} ` +
+        `claude-code-tg ready — chat_id=${config.allowedChatId} ` +
         `active_session=${sid ? shortSid(sid) : "-"} cwd=${getActiveCwd() ?? "-"}`
       );
     },
