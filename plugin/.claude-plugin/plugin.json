@@ -8,6 +8,5 @@
   "homepage": "https://github.com/ee92/claude-tg",
   "repository": "https://github.com/ee92/claude-tg",
   "license": "MIT",
-  "keywords": ["telegram", "bridge", "stop-hook", "remote-control"],
-  "hooks": "./hooks/hooks.json"
+  "keywords": ["telegram", "bridge", "stop-hook", "remote-control"]
 }
