@@ -1,20 +1,36 @@
-// HTTP intake server — Stop hook posts end-of-turn payloads here. Forwards to
-// Telegram only when the posted session matches the currently-connected one.
+// HTTP intake server — Claude Code's Stop hook posts end-of-turn event JSON
+// here. Forwards to Telegram only when the posted session matches the
+// currently-connected one.
+//
+// Stop hook event shape (subset we care about):
+//   { session_id, cwd, last_assistant_message, ... }
+//
+// `last_assistant_message` is added by Anthropic specifically to avoid the
+// JSONL-flush race that would otherwise force us to slurp the transcript file.
 //
 // All code paths log INFO so a missing message has a breadcrumb trail.
 
 import http from "node:http";
+import path from "node:path";
+import os from "node:os";
 import { config } from "./config.js";
 import { getActiveSessionId, sendAgentReply } from "./telegram.js";
 import { getLatestAssistantUuid } from "./sessions.js";
 import { shortSid } from "./format.js";
 
 const HOST = "127.0.0.1";
+const HOME = os.homedir();
 
-interface StopPayload {
+interface StopEvent {
   session_id?: string;
-  text?: string;
-  project?: string;
+  cwd?: string;
+  last_assistant_message?: string;
+}
+
+function projectShortname(cwd: string): string {
+  if (!cwd) return "";
+  if (cwd === HOME) return "~";
+  return path.basename(cwd);
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -47,18 +63,18 @@ export function startIntake(): http.Server {
         return;
       }
 
-      let payload: StopPayload;
+      let event: StopEvent;
       try {
-        payload = JSON.parse(await readBody(req)) as StopPayload;
+        event = JSON.parse(await readBody(req)) as StopEvent;
       } catch (e) {
         console.warn(`intake: bad json: ${(e as Error).message}`);
         send(res, 400, { ok: false, error: "bad json" });
         return;
       }
 
-      const sessionId = (payload.session_id ?? "").trim();
-      const text = (payload.text ?? "").trim();
-      const project = (payload.project ?? "").trim();
+      const sessionId = (event.session_id ?? "").trim();
+      const text = (event.last_assistant_message ?? "").trim();
+      const project = projectShortname((event.cwd ?? "").trim());
 
       if (!sessionId) {
         console.warn("intake: missing session_id");

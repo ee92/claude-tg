@@ -48,10 +48,12 @@ Two directions, one delivery path:
 - **`src/state.ts`** — atomic JSON read/write of `state.json` (active session
   id + cwd, plus a bounded reply-route map of recent outbound message_ids →
   the session id that produced them).
-- **`hook.sh`** — shell-only Claude Code Stop hook. Pulls the assistant text
-  from the `last_assistant_message` field on the event JSON (Anthropic added
-  this specifically to avoid the JSONL-flush race), POSTs it to the intake.
-  Silent no-op if the daemon is down. Never blocks Claude.
+- **`plugin/`** — Claude Code plugin (`.claude-plugin/plugin.json` manifest +
+  `hooks/hooks.json`) that registers the Stop hook automatically. The hook is
+  a one-line `curl` POST to the intake; if the daemon is down it fails
+  silently and never blocks Claude. The plugin uses `last_assistant_message`
+  from the event JSON (Anthropic added this specifically to avoid the
+  JSONL-flush race) so we don't have to slurp the transcript file.
 - **`src/index.ts`** — wires it all up, handles `SIGTERM`/`SIGINT`.
 
 ## Telegram commands
@@ -92,10 +94,11 @@ tapping `/resume`. The last 500 chunks the bot has sent are tracked.
 
 ## Setup
 
-Requires Node ≥ 22 and `jq` + `curl` in `$PATH` for the Stop hook.
+Requires Node ≥ 22 (for the daemon) and `curl` in `$PATH` (used by the
+plugin's Stop hook).
 
 ```sh
-# 1. install + build
+# 1. install + build the daemon
 npm install
 npm run build
 
@@ -103,25 +106,34 @@ npm run build
 cp .env.example .env
 $EDITOR .env       # set TELEGRAM_BOT_TOKEN and ALLOWED_CHAT_ID
 
-# 3. register the Stop hook in Claude Code's settings
-#    (~/.claude/settings.json), pointing at hook.sh:
-#
-#    {
-#      "hooks": {
-#        "Stop": [
-#          { "hooks": [{ "type": "command",
-#                        "command": "/abs/path/to/hook.sh",
-#                        "timeout": 5 }] }
-#        ]
-#      }
-#    }
-
-# 4. run it
+# 3. run the daemon
 npm start
 ```
 
+Then in any Claude Code session, install the plugin:
+
+```
+/plugin marketplace add ee92/claude-tg
+/plugin install claude-tg@claude-tg
+```
+
+The plugin registers a Stop hook that POSTs every end-of-turn event to the
+daemon's intake on `127.0.0.1:8765`. From then on, any session you connect
+to via `/resume` or `/new` (in Telegram) gets its replies forwarded.
+
 `/health` on `127.0.0.1:8765` returns `{ "ok": true }` once the intake is
 listening.
+
+### Developing the plugin locally
+
+If you've cloned the repo and want to test plugin changes without going
+through GitHub:
+
+```sh
+claude --plugin-dir ./plugin
+# inside Claude Code:
+/reload-plugins        # after edits
+```
 
 ## Running as a service
 
