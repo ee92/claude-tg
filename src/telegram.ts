@@ -11,9 +11,30 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { homedir } from "node:os";
 import { config } from "./config.js";
-import { listRecentSessions, findSessionCwd, findSessionsByPrefix, getSessionStats } from "./sessions.js";
+import {
+  listRecentSessions,
+  findSessionCwd,
+  findSessionsByPrefix,
+  getSessionStats,
+  listRecentUserMessages,
+  findUuidInTranscript,
+  countTurnsBetween,
+  getLatestUserMessageAnchor,
+} from "./sessions.js";
 import { age, shortSid, truncate, formatTokens } from "./format.js";
-import { loadState, saveState, appendReplyRoutes, lookupReplyRoute } from "./state.js";
+import {
+  loadState,
+  saveState,
+  appendReplyRoutes,
+  lookupReplyRouteEntry,
+  setModelOverride,
+  clearModelOverride,
+  getModelOverride,
+  setPendingResumeAt,
+  clearPendingResumeAt,
+  getPendingResumeAt,
+  type ReplyRoute,
+} from "./state.js";
 import { enqueueInbound, cancelActive } from "./inbound.js";
 import { renderSessionTodos } from "./sessionTodos.js";
 import { isBlocked, blockedReply, parseSlashCommand } from "./slashCommands.js";
@@ -24,6 +45,7 @@ import {
   commandArgHint,
   clearCommandCache,
 } from "./commandList.js";
+import { fetchModelList, clearModelCache } from "./modelList.js";
 import {
   markdownToTelegramBlocks,
   packBlocks,
@@ -62,6 +84,8 @@ const HELP_TEXT =
   "Commands:\n" +
   "/resume [id] – pick a recent session, or jump to one by id\n" +
   "/new – start a fresh session (in $HOME)\n" +
+  "/model – pick a model for the connected session (sticky, per-session)\n" +
+  "/rewind – pull the session back to a recent message and continue from there\n" +
   "/status – current connection\n" +
   "/compact – compact the connected session\n" +
   "/cancel – stop the in-flight turn and drain the queue\n" +
@@ -96,6 +120,71 @@ let pendingSwitch = false;
 // becomes the args and we forward `/{name} {args}`. Cleared on /cancel, any
 // other bot command, an inbound photo/document, or after consumption.
 let pendingArgs: { canonical: string } | null = null;
+
+// Pending cross-session reply-rewind confirmations. Keyed by short random
+// token (embedded in callback_data). Entries expire after REPLY_CONFIRM_TTL_MS;
+// also cancelled if the user sends a new message before tapping a button.
+// Single-tenant chat, so a plain Map is enough — no per-user partitioning.
+interface PendingReplyConfirmation {
+  token: string;
+  targetSid: string;
+  targetCwd: string;
+  targetProject: string;
+  anchorUuid: string;
+  jobText: string;
+  userMessageId: number;
+  chatId: number;
+  promptMsgId: number;
+  expiresAt: number;
+  // Picks breadcrumb wording on tap: "rewound" for replies, "replaced your
+  // message" for edits. Buttons and flow are identical otherwise.
+  gestureKind: "reply" | "edit";
+}
+
+const REPLY_CONFIRM_TTL_MS = 5 * 60 * 1000;
+const pendingReplyConfirmations = new Map<string, PendingReplyConfirmation>();
+
+function makeReplyConfirmToken(): string {
+  // 8-char base36, unique enough for the handful of confirmations alive at
+  // once. Callback_data caps at 64 bytes; `replyx:<token>:rewind` fits well.
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+}
+
+function scheduleReplyConfirmExpiry(token: string): void {
+  setTimeout(async () => {
+    const pending = pendingReplyConfirmations.get(token);
+    if (!pending) return;
+    pendingReplyConfirmations.delete(token);
+    try {
+      await bot.api.editMessageText(
+        pending.chatId,
+        pending.promptMsgId,
+        "Timed out — reply not sent.",
+      );
+    } catch {
+      /* prompt may have been edited / deleted; ignore */
+    }
+  }, REPLY_CONFIRM_TTL_MS).unref?.();
+}
+
+// Drop any pending cross-session confirmations for this chat. Called when
+// the user sends a new message before tapping a button — the new message
+// supersedes the pending one. Edits the prompt to say "Cancelled." so the
+// chat history shows what happened to the buttons.
+async function cancelPendingReplyConfirmations(chatId: number): Promise<void> {
+  const stale: PendingReplyConfirmation[] = [];
+  for (const p of pendingReplyConfirmations.values()) {
+    if (p.chatId === chatId) stale.push(p);
+  }
+  for (const p of stale) {
+    pendingReplyConfirmations.delete(p.token);
+    try {
+      await bot.api.editMessageText(p.chatId, p.promptMsgId, "Cancelled.");
+    } catch {
+      /* ignore */
+    }
+  }
+}
 
 function clearAllPending(): void {
   pendingNewCwd = null;
@@ -132,9 +221,21 @@ bot.command("status", async (ctx) => {
     ? fmt`Connected to session ${code}${shortSid(sid)}${code}\n${i}in ${i}${code}${cwd}${code}`
     : fmt`Connected to session ${code}${shortSid(sid)}${code}`;
 
+  // Surface the per-session model override (set via /model) if present.
+  // Show it next to the last-actually-ran model so the user can tell when
+  // a pick they just made hasn't taken effect yet (no turn run since).
+  const override = getModelOverride(state, sid);
   let msg = head;
+  if (override && stats?.model && override !== stats.model) {
+    msg = fmt`${msg}\n${b}model${b}: ${code}${override}${code} (override; last turn ran on ${code}${stats.model}${code})`;
+  } else if (override && !stats?.model) {
+    msg = fmt`${msg}\n${b}model${b}: ${code}${override}${code} (override; not yet used)`;
+  } else if (override) {
+    msg = fmt`${msg}\n${b}model${b}: ${code}${override}${code} (override)`;
+  } else if (stats?.model) {
+    msg = fmt`${msg}\n${b}model${b}: ${code}${stats.model}${code}`;
+  }
   if (stats) {
-    if (stats.model) msg = fmt`${msg}\n${b}model${b}: ${code}${stats.model}${code}`;
     if (stats.contextTokens != null) {
       msg = fmt`${msg}\n${b}context${b}: ${formatTokens(stats.contextTokens)} tokens (last turn)`;
     }
@@ -238,6 +339,197 @@ bot.command("disconnect", async (ctx) => {
     await ctx.reply(m.text, { entities: m.entities });
   } else {
     await ctx.reply("Already disconnected.");
+  }
+});
+
+// /model — render a tappable keyboard of the connected session's available
+// models. Tap a row to set a per-session override; tap Reset to clear.
+// The current model gets a green dot — current = override if set, else the
+// model the most recent assistant turn ran on. Persisted in state.json so
+// the choice survives bridge restarts; per-session, so each session has its
+// own pick. Applied at query() time in inbound.ts (see options.model).
+bot.command("model", async (ctx) => {
+  clearAllPending();
+  const target = await resolveTarget(ctx);
+  if (!target) return;
+  await ack(ctx);
+  try {
+    const models = await fetchModelList(target.cwd);
+    if (models.length === 0) {
+      await ctx.reply("No models available for this session.");
+      return;
+    }
+
+    const override = getModelOverride(state, target.sid);
+    const stats = await getSessionStats(target.sid).catch(() => null);
+    const effective = override ?? stats?.model ?? null;
+
+    const head = override
+      ? fmt`${b}Model for this session${b}\n${i}override active: ${i}${code}${override}${code}`
+      : fmt`${b}Model for this session${b}\n${i}no override; last turn ran on ${i}${code}${stats?.model || "?"}${code}`;
+
+    const keyboard = new InlineKeyboard();
+    for (const m of models) {
+      const marker = effective === m.value ? "🟢 " : "   ";
+      keyboard.text(`${marker}${m.displayName}`, `model:${m.value}`).row();
+    }
+    keyboard.text("✕ Reset to default", "model:reset");
+
+    await ctx.reply(head.text, { entities: head.entities, reply_markup: keyboard });
+  } catch (e) {
+    console.error(`telegram: /model fetch failed: ${(e as Error).message}`);
+    await ctx.reply(`⚠️ couldn't fetch model list: ${(e as Error).message}`);
+  }
+});
+
+bot.callbackQuery(/^model:(.+)$/, async (ctx) => {
+  const value = ctx.match[1];
+  await ctx.answerCallbackQuery();
+  const sid = state.active_session_id;
+  if (!sid) {
+    try { await ctx.editMessageText("No connected session — use /resume first."); } catch { /* ignore */ }
+    return;
+  }
+  if (value === "reset") {
+    state = clearModelOverride(state, sid);
+    await saveState(state);
+    const m = fmt`Cleared model override on ${code}${shortSid(sid)}${code}. Subsequent turns use the session's default.`;
+    try { await ctx.editMessageText(m.text, { entities: m.entities }); } catch { await ctx.reply(m.text, { entities: m.entities }); }
+    return;
+  }
+  state = setModelOverride(state, sid, value);
+  await saveState(state);
+  const m = fmt`Model set to ${code}${value}${code} for ${code}${shortSid(sid)}${code}. The next turn will use it.`;
+  try { await ctx.editMessageText(m.text, { entities: m.entities }); } catch { await ctx.reply(m.text, { entities: m.entities }); }
+});
+
+// /rewind — list the connected session's recent user-typed messages as
+// buttons. Tap one → record the resume anchor (parentUuid) on the active
+// session; the next typed message is delivered with `resumeSessionAt`,
+// which truncates history to that point. Same session id throughout — no
+// fork, no clone, no new entry in /resume.
+bot.command("rewind", async (ctx) => {
+  clearAllPending();
+  const target = await resolveTarget(ctx);
+  if (!target) return;
+  await ack(ctx);
+  try {
+    const recents = await listRecentUserMessages(target.sid, 5);
+    if (recents.length === 0) {
+      await ctx.reply("No prior messages to rewind to in this session.");
+      return;
+    }
+
+    const head = fmt`${b}Rewind to which message?${b}\n${i}The session is pulled back to right before the chosen message; type your next prompt and it continues from there.${i}`;
+    const keyboard = new InlineKeyboard();
+    for (const msg of recents) {
+      // Strip newlines so the button label fits a single Telegram row.
+      const snippet = truncate(msg.text.replace(/\s+/g, " "), 40);
+      const label = `${age(msg.timestamp)}: ${snippet}`;
+      // callback_data carries the parentUuid — the SDK's resume anchor.
+      // The picker shows USER messages (recognizable to the user), but the
+      // anchor is the assistant entry that immediately precedes them.
+      keyboard.text(label, `rewind:${msg.parentUuid}`).row();
+    }
+    keyboard.text("✕ Cancel", "rewind:cancel");
+
+    await ctx.reply(head.text, { entities: head.entities, reply_markup: keyboard });
+  } catch (e) {
+    console.error(`telegram: /rewind fetch failed: ${(e as Error).message}`);
+    await ctx.reply(`⚠️ couldn't read recent messages: ${(e as Error).message}`);
+  }
+});
+
+// Cross-session reply confirmation. callback_data shape: replyx:<token>:<action>
+// where action ∈ {switch, rewind, cancel}. The token references the
+// PendingReplyConfirmation map; switch performs an active-session change
+// only, rewind additionally arms `pending_resume_at` after pre-validating
+// the anchor in the target's JSONL, and cancel drops the stash silently.
+// Any failure (stale token, anchor missing, target's cwd vanished) edits
+// the prompt to a refuse-line; the user's text is never delivered.
+bot.callbackQuery(/^replyx:([^:]+):(switch|rewind|cancel)$/, async (ctx) => {
+  const token = ctx.match[1];
+  const action = ctx.match[2] as "switch" | "rewind" | "cancel";
+  await ctx.answerCallbackQuery();
+  const pending = pendingReplyConfirmations.get(token);
+  if (!pending) {
+    try { await ctx.editMessageText("Already handled (or timed out)."); } catch { /* ignore */ }
+    return;
+  }
+  pendingReplyConfirmations.delete(token);
+
+  if (action === "cancel") {
+    try { await ctx.editMessageText("Cancelled."); } catch { /* ignore */ }
+    return;
+  }
+
+  // Both switch and rewind paths perform the session switch; only rewind
+  // additionally validates+arms the resume anchor.
+  if (action === "rewind") {
+    const present = await findUuidInTranscript(pending.targetSid, pending.anchorUuid).catch(() => false);
+    if (!present) {
+      try {
+        await ctx.editMessageText(
+          "↳ Couldn't rewind — that point is no longer in the conversation. Reply not sent.",
+        );
+      } catch { /* ignore */ }
+      return;
+    }
+    state = setPendingResumeAt(state, pending.targetSid, pending.anchorUuid);
+    await saveState(state);
+  }
+
+  // Perform the switch.
+  await setActiveSession(pending.targetSid, pending.targetCwd);
+  pendingSwitch = false;
+  pendingNewCwd = null;
+
+  // Edit the original prompt with the orient breadcrumb so the user can see
+  // what happened in the chat history (and the buttons disappear). The verb
+  // tracks the original gesture: "rewound" for replies, "replaced your
+  // message" for edits.
+  let breadcrumb: string;
+  if (action === "switch") {
+    breadcrumb = `↳ Switched to ${pending.targetProject}.`;
+  } else {
+    const turns = await countTurnsBetween(pending.targetSid, pending.anchorUuid).catch(() => 0);
+    const verb = pending.gestureKind === "edit"
+      ? "replaced your message"
+      : "rewound";
+    breadcrumb = `↳ Switched to ${pending.targetProject} and ${verb}. ${turnsTail(turns)}.`;
+  }
+  try { await ctx.editMessageText(breadcrumb); } catch { /* ignore */ }
+
+  // Now enqueue the deferred turn against the (now active) target session.
+  enqueueInbound({
+    text: pending.jobText,
+    chatId: pending.chatId,
+    userMessageId: pending.userMessageId,
+    targetSessionId: pending.targetSid,
+    targetCwd: pending.targetCwd,
+  });
+});
+
+bot.callbackQuery(/^rewind:(.+)$/, async (ctx) => {
+  const value = ctx.match[1];
+  await ctx.answerCallbackQuery();
+  if (value === "cancel") {
+    try { await ctx.editMessageText("Rewind cancelled."); } catch { /* ignore */ }
+    return;
+  }
+  const sid = state.active_session_id;
+  if (!sid) {
+    try { await ctx.editMessageText("No connected session — use /resume first."); } catch { /* ignore */ }
+    return;
+  }
+  try {
+    state = setPendingResumeAt(state, sid, value);
+    await saveState(state);
+    const m = fmt`Rewound ${code}${shortSid(sid)}${code} to the chosen point.\n${i}Type your next message — the conversation continues from there.${i}`;
+    try { await ctx.editMessageText(m.text, { entities: m.entities }); } catch { await ctx.reply(m.text, { entities: m.entities }); }
+  } catch (e) {
+    console.error(`telegram: /rewind state-write failed: ${(e as Error).message}`);
+    try { await ctx.editMessageText(`⚠️ rewind failed: ${(e as Error).message}`); } catch { /* ignore */ }
   }
 });
 
@@ -375,39 +667,238 @@ async function performSwitch(ctx: Context, arg: string): Promise<void> {
   await ctx.reply(m.text, { entities: m.entities });
 }
 
-// Reply-to-switch: if the inbound message is a reply to one of the bot's
-// previous agent-reply chunks, treat that as an implicit /switch — connect
-// to the session that produced the chunk and acknowledge with the same
-// notice the explicit /switch command sends. Idempotent if we're already
-// on that session, and a no-op if there's no reply / no matching route.
+// Reply-as-rewind dispatcher. Replaces the older "reply switches sessions"
+// shortcut with a richer state machine:
 //
-// After this returns, normal active-session resolution will pick up the
-// (possibly newly-set) active session and the rest of the handler runs
-// against it. Inbound dispatch and outbound delivery both stay consistent
-// because everything keys off `active_session_id`.
+//   - No reply / no route entry / reply to a non-bot message → "proceed":
+//     the gesture has no special meaning; caller enqueues normally.
+//   - Reply to one of the bot's messages we don't track (aged out, breadcrumb,
+//     untracked system message) → "refused": breadcrumb sent, caller drops.
+//   - Legacy entry (no anchor captured) → "proceed" after a silent switch:
+//     same as the old reply-as-switch behavior; preserved during transition.
+//   - Same-context entry with anchor (active sid === entry.sid OR no active):
+//     pre-validate the anchor in the JSONL; on success arm `pending_resume_at`
+//     and post a breadcrumb. Caller enqueues the prepared text.
+//   - Cross-session entry with anchor: post a confirmation prompt with two
+//     buttons. Caller does NOT enqueue — the callback handler will, after
+//     the user picks Switch only / Switch and rewind / Cancel.
+//
+// `jobText` is the fully-prepared prompt the caller would otherwise enqueue
+// (the user's text for plain messages; the Read-tool prompt with attachment
+// path baked in for photos/documents). The cross-session branch stashes it
+// verbatim so the deferred enqueue lands the same payload after the switch.
+type ReplyOutcome =
+  | { kind: "proceed" }              // caller enqueues normally
+  | { kind: "rewind-armed" }         // pending_resume_at set; caller enqueues
+  | { kind: "cross-session-pending" } // confirmation prompt sent; caller drops
+  | { kind: "refused" };              // breadcrumb sent; caller drops
+
+// Slash-command / pendingArgs paths use the legacy "reply switches session"
+// shortcut — rewinding to anchor a slash command isn't useful, and a
+// cross-session confirmation prompt would be surprising for what reads as
+// a single command tap. This silent variant is the pre-rewind behavior:
+// if a reply hits a tracked entry, switch to that entry's session quietly
+// and post the standard "Connected to ..." notice. No-op otherwise.
 async function maybeSwitchOnReply(ctx: Context): Promise<void> {
   const replyTo = ctx.message?.reply_to_message?.message_id;
   if (!replyTo) return;
-  const sid = lookupReplyRoute(state, replyTo);
-  if (!sid) return;
-  if (sid === state.active_session_id) return; // already on it
-  const cwd = await findSessionCwd(sid);
+  const entry = lookupReplyRouteEntry(state, replyTo);
+  if (!entry) return;
+  if (entry.sid === state.active_session_id) return;
+  const cwd = await findSessionCwd(entry.sid);
   if (!cwd) {
     console.warn(
-      `telegram: reply-route hit but cwd missing on disk sid=${shortSid(sid)} msg_id=${replyTo}`,
+      `telegram: reply-route hit but cwd missing on disk sid=${shortSid(entry.sid)} msg_id=${replyTo}`,
     );
     return;
   }
-  console.log(
-    `telegram: reply-driven switch sid=${shortSid(sid)} msg_id=${replyTo}`,
-  );
-  await setActiveSession(sid, cwd);
-  // An explicit reply-driven switch supersedes any half-armed /switch or /new.
+  await setActiveSession(entry.sid, cwd);
   pendingSwitch = false;
   pendingNewCwd = null;
   const project = path.basename(cwd) || cwd;
-  const m = fmt`Connected to ${code}${shortSid(sid)}${code} · ${b}${project}${b}\n${i}in ${i}${code}${cwd}${code}`;
+  const m = fmt`Connected to ${code}${shortSid(entry.sid)}${code} · ${b}${project}${b}\n${i}in ${i}${code}${cwd}${code}`;
   await ctx.reply(m.text, { entities: m.entities });
+}
+
+async function sendBreadcrumb(ctx: Context, body: string): Promise<void> {
+  try {
+    await ctx.reply(`↳ ${body}`);
+  } catch (e) {
+    console.warn(`telegram: breadcrumb send failed: ${(e as Error).message}`);
+  }
+}
+
+function turnsTail(n: number): string {
+  return `${n} turn${n === 1 ? "" : "s"} dropped`;
+}
+
+async function handleReplyGesture(ctx: Context, jobText: string): Promise<ReplyOutcome> {
+  const replyTo = ctx.message?.reply_to_message?.message_id;
+  if (!replyTo) return { kind: "proceed" };
+
+  const entry = lookupReplyRouteEntry(state, replyTo);
+
+  // Tells "did the user reply to one of our bot's messages" — used to decide
+  // whether a missing route entry means "aged out / not-tracked" (refuse) or
+  // "they're replying to something we never owned" (proceed). Single-tenant
+  // chat, so any bot reply is ours.
+  const replyFrom = ctx.message?.reply_to_message?.from;
+  const repliedToBot = replyFrom?.is_bot === true;
+
+  if (!entry) {
+    if (repliedToBot) {
+      await sendBreadcrumb(
+        ctx,
+        "Don't have a record of that message. Reply not sent. Send a normal message if you want it to land in the connected session.",
+      );
+      return { kind: "refused" };
+    }
+    return { kind: "proceed" };
+  }
+
+  // Legacy entry (pre-rewind support, or anchor capture failed): preserve
+  // the old reply-as-switch behavior. Switch sessions silently if needed,
+  // then let the caller enqueue normally.
+  if (!entry.anchorUuid || !entry.kind) {
+    if (entry.sid !== state.active_session_id) {
+      const cwd = await findSessionCwd(entry.sid);
+      if (!cwd) {
+        console.warn(
+          `telegram: legacy reply-route hit but cwd missing sid=${shortSid(entry.sid)}`,
+        );
+        return { kind: "proceed" };
+      }
+      await setActiveSession(entry.sid, cwd);
+      pendingSwitch = false;
+      pendingNewCwd = null;
+      const project = path.basename(cwd) || cwd;
+      const m = fmt`Connected to ${code}${shortSid(entry.sid)}${code} · ${b}${project}${b}\n${i}in ${i}${code}${cwd}${code}`;
+      await ctx.reply(m.text, { entities: m.entities });
+    }
+    return { kind: "proceed" };
+  }
+
+  // Replying to one's own past message has no clear intent — edit-as-rewind
+  // covers "replace what I said". Fall through to a normal enqueue. The
+  // user-kind route entry stays on disk because the edit handler needs it.
+  if (entry.kind === "user") {
+    return { kind: "proceed" };
+  }
+
+  return dispatchAnchoredGesture(
+    ctx,
+    entry as ReplyRoute & { kind: "assistant" | "user"; anchorUuid: string },
+    jobText,
+    "reply",
+  );
+}
+
+// Shared back-end for reply-as-rewind and edit-as-rewind. The caller has
+// already verified the entry has a usable kind + anchorUuid; this routine
+// owns the same/cross-session decision and the 0-turn skip.
+async function dispatchAnchoredGesture(
+  ctx: Context,
+  entry: ReplyRoute & { kind: "assistant" | "user"; anchorUuid: string },
+  jobText: string,
+  gestureKind: "reply" | "edit",
+): Promise<ReplyOutcome> {
+  const isSameContext =
+    state.active_session_id === null || state.active_session_id === entry.sid;
+
+  if (isSameContext) {
+    if (state.active_session_id === null) {
+      const cwd = await findSessionCwd(entry.sid);
+      if (!cwd) {
+        await sendBreadcrumb(ctx, "Couldn't find that session on disk. Reply not sent.");
+        return { kind: "refused" };
+      }
+      await setActiveSession(entry.sid, cwd);
+    }
+
+    const present = await findUuidInTranscript(entry.sid, entry.anchorUuid).catch(() => false);
+    if (!present) {
+      await sendBreadcrumb(
+        ctx,
+        "Couldn't rewind — that point is no longer in the conversation. Reply not sent.",
+      );
+      return { kind: "refused" };
+    }
+
+    state = setPendingResumeAt(state, entry.sid, entry.anchorUuid);
+    await saveState(state);
+
+    const turns = await countTurnsBetween(entry.sid, entry.anchorUuid).catch(() => 0);
+    const verb = gestureKind === "edit"
+      ? "Replaced your message"
+      : "Rewound to your reply target";
+    await sendBreadcrumb(ctx, `${verb}. ${turnsTail(turns)}.`);
+    pendingSwitch = false;
+    pendingNewCwd = null;
+    return { kind: "rewind-armed" };
+  }
+
+  // Cross-session: a single tap would both switch and (potentially)
+  // destructively rewind a session the user can't see right now.
+  const cwd = await findSessionCwd(entry.sid);
+  if (!cwd) {
+    await sendBreadcrumb(ctx, "Couldn't find that session on disk. Reply not sent.");
+    return { kind: "refused" };
+  }
+  const project = path.basename(cwd) || cwd;
+
+  // Skip the confirmation prompt when nothing would be dropped — replying to
+  // the latest bot message in another session, or editing a user message
+  // whose post-anchor turns are already gone, has no destructive effect.
+  // Behaves like a silent "Switch only" with a one-line breadcrumb.
+  const turns = await countTurnsBetween(entry.sid, entry.anchorUuid).catch(() => 0);
+  if (turns === 0) {
+    await setActiveSession(entry.sid, cwd);
+    pendingSwitch = false;
+    pendingNewCwd = null;
+    const body = gestureKind === "edit"
+      ? `Switched to ${project} and replaced your message.`
+      : `Switched to ${project}.`;
+    await sendBreadcrumb(ctx, body);
+    return { kind: "proceed" };
+  }
+
+  const token = makeReplyConfirmToken();
+  const expiresAt = Date.now() + REPLY_CONFIRM_TTL_MS;
+  const keyboard = new InlineKeyboard()
+    .text("Switch only", `replyx:${token}:switch`)
+    .text("Switch and rewind", `replyx:${token}:rewind`)
+    .row()
+    .text("✕ Cancel", `replyx:${token}:cancel`);
+
+  const promptBody = gestureKind === "edit"
+    ? `You're editing a message in ${project}.\nWhat do you want to do?`
+    : `You're replying to a message in ${project}.\nWhat do you want to do?`;
+  let promptMsgId: number;
+  try {
+    const sent = await ctx.reply(promptBody, { reply_markup: keyboard });
+    promptMsgId = sent.message_id;
+  } catch (e) {
+    console.error(`telegram: cross-session prompt send failed: ${(e as Error).message}`);
+    return { kind: "refused" };
+  }
+
+  // ctx.msg is the polymorphic accessor — message_id for reply, editedMessage
+  // for edit (Telegram preserves the original id across edits).
+  pendingReplyConfirmations.set(token, {
+    token,
+    targetSid: entry.sid,
+    targetCwd: cwd,
+    targetProject: project,
+    anchorUuid: entry.anchorUuid,
+    jobText,
+    userMessageId: ctx.msg!.message_id,
+    chatId: ctx.chat!.id,
+    promptMsgId,
+    expiresAt,
+    gestureKind,
+  });
+  scheduleReplyConfirmExpiry(token);
+  return { kind: "cross-session-pending" };
 }
 
 // Resolve the connected session + cwd, replying with a helpful error and
@@ -445,18 +936,19 @@ bot.on("message:text", async (ctx) => {
   const text = ctx.message.text.trim();
   if (!text) return;
 
-  // Reply-driven switch first: a reply to a tracked agent-reply chunk is
-  // treated as an implicit /switch and supersedes any half-armed /switch
-  // or /new. Sets active_session_id + posts the same "Connected to ..."
-  // notice the /switch command does. Runs for both text and slash-command
-  // dispatches because the user may want to re-target a slash command at
-  // an older session by replying to one of its messages.
-  await maybeSwitchOnReply(ctx);
+  // Any new inbound message supersedes a pending cross-session reply
+  // confirmation — drop those before doing anything else, so the user's
+  // newly-typed message takes effect cleanly. The gesture handler below
+  // may create a fresh confirmation of its own.
+  await cancelPendingReplyConfirmations(ctx.chat.id);
 
   // pendingArgs wins over the slash-command branch — hints like /loop's
   // "[interval] <prompt>" naturally start with a slash, so we can't gate on
   // text.startsWith("/"). /cancel is the explicit escape hatch.
   if (pendingArgs) {
+    // pendingArgs and slash-command paths use the legacy "reply switches
+    // session" shortcut; rewinding to anchor a slash command isn't useful.
+    await maybeSwitchOnReply(ctx);
     const cmd = pendingArgs.canonical;
     pendingArgs = null;
     const target = await resolveTarget(ctx);
@@ -476,6 +968,7 @@ bot.on("message:text", async (ctx) => {
   // form, reject blocklisted, arm pendingArgs if a hint exists for a bare
   // tap, otherwise forward to the connected session.
   if (text.startsWith("/")) {
+    await maybeSwitchOnReply(ctx);
     const parsed = parseSlashCommand(text);
     if (!parsed) {
       await ctx.reply("That doesn't look like a valid slash command. /help shows what's available.");
@@ -536,6 +1029,14 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
+  // Plain-text fallthrough — route through the reply-as-rewind dispatcher.
+  // It may switch sessions, arm a rewind anchor, send a refuse breadcrumb,
+  // or post a confirmation prompt for a cross-session reply. In the last
+  // two cases the user's text is not enqueued here (deferred to the
+  // confirmation callback, or refused outright).
+  const outcome = await handleReplyGesture(ctx, text);
+  if (outcome.kind === "refused" || outcome.kind === "cross-session-pending") return;
+
   const target = await resolveTarget(ctx);
   if (!target) return;
 
@@ -567,12 +1068,11 @@ async function downloadTelegramFile(filePath: string, savePath: string): Promise
 // AND larger work). Until that's fixed upstream, the file-path approach is
 // reliable at any size.
 bot.on("message:photo", async (ctx) => {
-  await maybeSwitchOnReply(ctx);
+  // New attachment supersedes a pending cross-session confirmation.
+  await cancelPendingReplyConfirmations(ctx.chat.id);
   // A non-text inbound aborts a half-armed args prompt — the photo isn't
   // plausibly the args the user was being asked for.
   pendingArgs = null;
-  const target = await resolveTarget(ctx);
-  if (!target) return;
 
   await ack(ctx);
 
@@ -587,7 +1087,7 @@ bot.on("message:photo", async (ctx) => {
       `${ctx.chat.id}-${ctx.message.message_id}${ext}`,
     );
     await downloadTelegramFile(file.file_path, localPath);
-    console.log(`telegram: photo saved sid=${shortSid(target.sid)} path=${localPath}`);
+    console.log(`telegram: photo saved path=${localPath}`);
   } catch (e) {
     console.error(`telegram: photo download failed: ${(e as Error).message}`);
     await ctx.reply("⚠️ couldn't fetch that photo from Telegram.");
@@ -598,6 +1098,14 @@ bot.on("message:photo", async (ctx) => {
   const promptText = caption
     ? `The user attached an image at ${localPath}. Read it with the Read tool, then respond.\n\nCaption: ${caption}`
     : `The user attached an image at ${localPath}. Read it with the Read tool, then respond.`;
+
+  // Reply-as-rewind: dispatch the gesture with the prepared prompt. May
+  // switch sessions, arm a rewind, or defer enqueue to a button tap.
+  const outcome = await handleReplyGesture(ctx, promptText);
+  if (outcome.kind === "refused" || outcome.kind === "cross-session-pending") return;
+
+  const target = await resolveTarget(ctx);
+  if (!target) return;
 
   enqueueInbound({
     text: promptText,
@@ -615,11 +1123,9 @@ bot.on("message:photo", async (ctx) => {
 // a less informative error. The original filename is preserved in both the
 // on-disk path and the prompt so the model has useful naming context.
 bot.on("message:document", async (ctx) => {
-  await maybeSwitchOnReply(ctx);
+  await cancelPendingReplyConfirmations(ctx.chat.id);
   // See photo handler: a non-text inbound aborts a half-armed args prompt.
   pendingArgs = null;
-  const target = await resolveTarget(ctx);
-  if (!target) return;
 
   const doc = ctx.message.document;
   if (typeof doc.file_size === "number" && doc.file_size > DOCUMENT_MAX_BYTES) {
@@ -654,7 +1160,7 @@ bot.on("message:document", async (ctx) => {
     );
     await downloadTelegramFile(file.file_path, localPath);
     console.log(
-      `telegram: document saved sid=${shortSid(target.sid)} path=${localPath} ` +
+      `telegram: document saved path=${localPath} ` +
       `mime=${doc.mime_type ?? "?"} bytes=${doc.file_size ?? "?"}`,
     );
   } catch (e) {
@@ -669,6 +1175,12 @@ bot.on("message:document", async (ctx) => {
     "Read it with the Read tool, then respond.";
   const promptText = caption ? `${head}\n\nCaption: ${caption}` : head;
 
+  const outcome = await handleReplyGesture(ctx, promptText);
+  if (outcome.kind === "refused" || outcome.kind === "cross-session-pending") return;
+
+  const target = await resolveTarget(ctx);
+  if (!target) return;
+
   enqueueInbound({
     text: promptText,
     chatId: ctx.chat.id,
@@ -678,18 +1190,119 @@ bot.on("message:document", async (ctx) => {
   });
 });
 
+// Edit-as-rewind. Telegram fires a separate update on edits, preserving the
+// original message_id — we use it to look up the route entry from the turn
+// that originally produced the message. Untracked/legacy/unreachable shapes
+// are ignored silently so stale edits don't get unsolicited breadcrumbs.
+bot.on("edited_message:text", async (ctx) => {
+  await cancelPendingReplyConfirmations(ctx.chat.id);
+  pendingArgs = null;
+
+  const editedMsgId = ctx.editedMessage.message_id;
+  const editedText = ctx.editedMessage.text.trim();
+
+  if (!editedText) {
+    await sendBreadcrumb(
+      ctx,
+      "Edited to nothing — no rewind. Edit again with text to replace.",
+    );
+    return;
+  }
+
+  const entry = lookupReplyRouteEntry(state, editedMsgId);
+  if (!entry) return; // Untracked edit (system message, /status reply, aged out).
+  if (!entry.anchorUuid || !entry.kind) return; // Legacy entry — can't anchor.
+  if (entry.kind === "assistant") {
+    // Telegram doesn't allow editing other users' messages; this branch is
+    // unreachable in practice. Defensive log + drop if it ever surfaces.
+    console.warn(
+      `telegram: edited_message hit an assistant-kind route msg_id=${editedMsgId}; ignoring`,
+    );
+    return;
+  }
+
+  const outcome = await dispatchAnchoredGesture(
+    ctx,
+    entry as ReplyRoute & { kind: "user"; anchorUuid: string },
+    editedText,
+    "edit",
+  );
+  if (outcome.kind === "refused" || outcome.kind === "cross-session-pending") return;
+
+  const target = await resolveTarget(ctx);
+  if (!target) return;
+
+  await ack(ctx);
+  enqueueInbound({
+    text: editedText,
+    chatId: ctx.chat.id,
+    userMessageId: editedMsgId,
+    targetSessionId: target.sid,
+    targetCwd: target.cwd,
+  });
+});
+
 // Read accessors for other modules.
 export function getActiveSessionId(): string | null { return state.active_session_id; }
 export function getActiveCwd(): string | null { return state.active_cwd; }
 
+// Per-session model override lookup, read by inbound.ts on every query()
+// to apply the user's /model pick. Reads from telegram.ts's in-memory state
+// so the value is always fresh (state.ts persists, telegram.ts mutates).
+export function getModelOverrideFor(sid: string): string | null {
+  return getModelOverride(state, sid);
+}
+
+// Reply-as-rewind support — record a route entry for a user-typed Telegram
+// message, keyed by its msg_id, so a later reply to that message means
+// "rewind to right before this point and replace it." Called by inbound.ts
+// once a turn completes successfully — at that point the SDK has written
+// the user's JSONL entry, and `getLatestUserMessageAnchor` resolves its
+// parentUuid (the resume anchor: history loads up to and including that
+// uuid, so the new prompt lands in the dropped message's place).
+//
+// Best-effort: if the lookup fails (no transcript, no parseable user entry
+// at the tail, etc.), no entry is written. Replying then falls into the
+// "no entry" branch and refuses cleanly — no silent legacy switch.
+export async function recordUserMessageRoute(sid: string, telegramMsgId: number): Promise<void> {
+  const anchorUuid = await getLatestUserMessageAnchor(sid).catch(() => null);
+  if (!anchorUuid) {
+    console.warn(`telegram: user-route skipped sid=${shortSid(sid)} msg_id=${telegramMsgId} (no anchor)`);
+    return;
+  }
+  state = appendReplyRoutes(state, [{ msg_id: telegramMsgId, sid, kind: "user", anchorUuid }]);
+  try {
+    await saveState(state);
+  } catch (e) {
+    console.warn(
+      `telegram: user-route persist failed sid=${shortSid(sid)} msg_id=${telegramMsgId}: ${(e as Error).message}`,
+    );
+  }
+}
+
+// Single-shot rewind anchor lookup. Reads the pending resumeSessionAt for
+// the session, clears it (in memory and on disk) so the next turn isn't
+// affected, and returns the anchor uuid (or null if none was pending).
+// Called by inbound.ts at the top of each query() — the clear-on-read
+// guarantees the rewound history is loaded for exactly one turn.
+export async function consumePendingResumeAtFor(sid: string): Promise<string | null> {
+  const anchor = getPendingResumeAt(state, sid);
+  if (!anchor) return null;
+  state = clearPendingResumeAt(state, sid);
+  await saveState(state);
+  return anchor;
+}
+
 // Mutator used by the new-session path in inbound.ts. Sets and persists the
 // active connection so the Stop hook's POST is recognised as the active sid.
-// Also drops the /commands cache: its display→canonical map is per-cwd, so
-// stale entries from the previous session would mistranslate slash taps.
+// Also drops the /commands and /model caches: each is keyed per-cwd, so
+// stale entries from the previous session would mistranslate slash taps
+// or list the wrong models.
 export async function setActiveSession(sid: string, cwd: string): Promise<void> {
   state = { ...state, active_session_id: sid, active_cwd: cwd };
   await saveState(state);
   clearCommandCache();
+  clearModelCache();
   console.log(`telegram: active session set sid=${shortSid(sid)} cwd=${cwd}`);
 }
 
@@ -699,14 +1312,21 @@ export async function setActiveSession(sid: string, cwd: string): Promise<void> 
 // text if Telegram rejects the formatted send. Called from intake on every
 // Stop-hook delivery.
 //
+// `anchorUuid`, when provided, is the assistant entry's JSONL uuid for the
+// turn we're delivering. Each chunk's route entry stores it so a later
+// reply-to-rewind can use it as `resumeSessionAt`. Multi-chunk turns share
+// the SAME anchor (the final assistant entry) — replying to any chunk →
+// same rewind result. Pass null for non-turn deliveries (e.g. forwarded
+// /cost output) so those entries stay in legacy switch-only mode.
+//
 // Side effect: each sent chunk's Telegram message_id is recorded in the
-// reply-route map so a later "reply to" of any chunk routes the next turn
-// back to this session. Persisted once per call (after all chunks land) to
+// reply-route map. Persisted once per call (after all chunks land) to
 // minimize state.json churn.
 export async function sendAgentReply(
   sessionId: string,
   projectLabel: string,
   text: string,
+  anchorUuid?: string | null,
 ): Promise<void> {
   const header = `<b>${escHtml(projectLabel || "?")}</b> · <code>${escHtml(shortSid(sessionId))}</code>`;
   const blocks = markdownToTelegramBlocks(text);
@@ -740,7 +1360,12 @@ export async function sendAgentReply(
   }
 
   if (sentIds.length > 0) {
-    state = appendReplyRoutes(state, sentIds, sessionId);
+    const routes: ReplyRoute[] = sentIds.map((msg_id) =>
+      anchorUuid
+        ? { msg_id, sid: sessionId, kind: "assistant" as const, anchorUuid }
+        : { msg_id, sid: sessionId },
+    );
+    state = appendReplyRoutes(state, routes);
     try {
       await saveState(state);
     } catch (e) {
@@ -761,6 +1386,8 @@ export async function registerCommandMenu(): Promise<void> {
   await bot.api.setMyCommands([
     { command: "resume",     description: "Pick a recent session, or jump by id" },
     { command: "new",        description: "Start a fresh session in $HOME" },
+    { command: "model",      description: "Pick a model for the connected session" },
+    { command: "rewind",     description: "Pull the session back to a recent message" },
     { command: "status",     description: "Show current connection" },
     { command: "compact",    description: "Compact the connected session" },
     { command: "cancel",     description: "Stop the in-flight turn and drain the queue" },

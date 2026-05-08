@@ -24,9 +24,9 @@
 // here.
 //
 // Phase-3 candidates (commands worth a Telegram-native UX later):
-//   /model, /agents, /skills, /memory, /permissions
+//   /agents, /skills, /memory, /permissions
 // They sit on the block list for now and graduate to override when their
-// dedicated UX ships.
+// dedicated UX ships. /model and /rewind already shipped (Phase 3 scope).
 
 // CLI commands that need a real terminal, browser, or are otherwise unusable
 // over a bridge daemon. Listed without the leading slash; lookup normalises.
@@ -34,7 +34,7 @@ export const BLOCKED_COMMANDS: ReadonlySet<string> = new Set([
   // Auth flows (browser launch, would log out the daemon, etc.)
   "account", "api-key", "login", "logout", "signin", "signout", "upgrade",
   // TUI pickers / editors
-  "agents", "config", "hooks", "memory", "model", "output-style",
+  "agents", "config", "hooks", "memory", "output-style",
   "permissions", "plugins", "skills",
   // Unavailable in non-interactive SDK mode (CLI rejects with "not available
   // in this environment" — verified by probe); revisit when the native MCP
@@ -64,8 +64,9 @@ export const LEGACY_ALIASES: ReadonlyMap<string, string> = new Map([
 export const BOT_HANDLED_COMMANDS: ReadonlySet<string> = new Set([
   // Distinct
   "new", "cancel", "disconnect", "commands",
-  // Override
-  "resume",
+  // Override (Telegram-native replacement for a CLI command that's
+  // TUI-only or otherwise unusable over a bridge)
+  "resume", "model", "rewind",
   // Legacy aliases (still resolve during deprecation)
   "sessions", "switch",
   // Wrap (CLI runs underneath but bot adds chrome)
@@ -85,7 +86,6 @@ const blockedHints: Record<string, string> = {
   "logout": "Would disconnect the bridge daemon itself. Do this on the host instead.",
   "signin": "The bridge already runs as your signed-in session.",
   "signout": "Would disconnect the bridge daemon itself. Do this on the host instead.",
-  "model": "Native model picker is on the roadmap.",
   "agents": "Native agents browser is on the roadmap.",
   "skills": "Native skills browser is on the roadmap.",
   "memory": "Native memory editor is on the roadmap.",

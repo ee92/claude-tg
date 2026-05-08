@@ -10,7 +10,15 @@
 import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "./config.js";
-import { bot, getActiveSessionId, setActiveSession, sendAgentReply } from "./telegram.js";
+import {
+  bot,
+  getActiveSessionId,
+  setActiveSession,
+  sendAgentReply,
+  getModelOverrideFor,
+  consumePendingResumeAtFor,
+  recordUserMessageRoute,
+} from "./telegram.js";
 import { shortSid, formatTokens } from "./format.js";
 import { claudeBinaryPath } from "./sdkBinary.js";
 import { createTelegramAttachServer } from "./telegramAttachTool.js";
@@ -160,6 +168,20 @@ async function runJob(job: InboundJob): Promise<void> {
       console.error(`inbound: failed to report error to telegram: ${(e as Error).message}`);
     }
   }
+
+  // On success, record a route entry for the user's Telegram message so a
+  // later reply-to-rewind can land at the parentUuid of this user JSONL
+  // entry (i.e. "rewind to right before this message, replace it"). Done
+  // after query() returns because the SDK only writes the user entry as it
+  // runs — pre-turn the parentUuid doesn't exist on disk yet.
+  if (result.code === 0) {
+    try {
+      await recordUserMessageRoute(job.targetSessionId, job.userMessageId);
+    } catch (e) {
+      console.warn(`inbound: recordUserMessageRoute failed: ${(e as Error).message}`);
+    }
+  }
+
   // On success: the Stop hook will deliver the reply via /stop. Nothing to do.
   // On user-cancel: the /cancel handler already informed the user.
 }
@@ -176,11 +198,28 @@ async function runClaude(job: InboundJob & { targetSessionId: string }): Promise
   let stderr = "";
   let sdkStderr = "";
 
+  // /model override applied per-turn. Read from telegram.ts's in-memory
+  // state at query() time so a tap that lands while a turn is queued takes
+  // effect on the next turn out of the queue. Null = no override; SDK uses
+  // the session's default model.
+  const modelOverride = getModelOverrideFor(job.targetSessionId);
+
+  // /rewind anchor — single-shot. If the user picked a rewind point (in
+  // /rewind picker or by waking us via callback) we read+clear it here so
+  // ONLY this next turn loads the truncated history. Subsequent turns
+  // resume normally and follow the new branch the SDK just appended.
+  const resumeAnchor = await consumePendingResumeAtFor(job.targetSessionId);
+
   try {
     const q = query({
       prompt: job.text,
       options: {
         resume: job.targetSessionId,
+        // When set, the SDK loads history "up to and including" this uuid
+        // and ignores everything after, so the new prompt lands at that
+        // point. The anchor is an assistant-message uuid (the parentUuid
+        // of the user message the picker showed).
+        ...(resumeAnchor ? { resumeSessionAt: resumeAnchor } : {}),
         cwd: job.targetCwd,
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
@@ -190,6 +229,9 @@ async function runClaude(job: InboundJob & { targetSessionId: string }): Promise
         // variant when both are on disk, even on glibc systems — see the
         // header comment in ./sdkBinary.ts for details.
         pathToClaudeCodeExecutable: claudeBinaryPath,
+        // Per-session /model override. Accepts aliases (sonnet/opus/haiku)
+        // or full ids; undefined falls through to the session default.
+        ...(modelOverride ? { model: modelOverride } : {}),
         // Append our Telegram-shape guidance to the default Claude Code system
         // prompt. Only added on bridge-driven turns — sessions driven directly
         // from the desktop client are unaffected.
@@ -513,6 +555,16 @@ async function runClaudeNew(job: InboundJob): Promise<ClaudeResult> {
     console.log(
       `inbound: new-session ok sid=${capturedSid ? shortSid(capturedSid) : "?"} cwd=${job.targetCwd}`,
     );
+    // Record the user-message route for the kickoff prompt so a later reply
+    // to that very first message can rewind to it (semantically a no-op for
+    // a single-turn session, but consistent with the resume path).
+    if (capturedSid) {
+      try {
+        await recordUserMessageRoute(capturedSid, job.userMessageId);
+      } catch (e) {
+        console.warn(`inbound: recordUserMessageRoute (new) failed: ${(e as Error).message}`);
+      }
+    }
   }
 
   return { code: exitCode, stderr };

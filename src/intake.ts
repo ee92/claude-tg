@@ -6,6 +6,7 @@
 import http from "node:http";
 import { config } from "./config.js";
 import { getActiveSessionId, sendAgentReply } from "./telegram.js";
+import { getLatestAssistantUuid } from "./sessions.js";
 import { shortSid } from "./format.js";
 
 const HOST = "127.0.0.1";
@@ -81,7 +82,15 @@ export function startIntake(): http.Server {
       }
 
       try {
-        await sendAgentReply(sessionId, project, text);
+        // Resolve the turn's anchor uuid from the on-disk JSONL — the Stop
+        // hook fires AFTER the assistant entry is written, so the latest
+        // assistant uuid in the transcript IS the one belonging to this
+        // turn. Each chunk we send back gets stamped with that anchor so
+        // a later reply-as-rewind can use it. Best-effort: if the lookup
+        // fails for any reason, the chunks just store legacy-shape routes
+        // (reply still routes the right session, just no rewind anchor).
+        const anchorUuid = await getLatestAssistantUuid(sessionId).catch(() => null);
+        await sendAgentReply(sessionId, project, text, anchorUuid);
         console.log(`intake: forwarded sid=${shortSid(sessionId)} bytes=${text.length}`);
         send(res, 202, { ok: true, forwarded: true });
       } catch (e) {
